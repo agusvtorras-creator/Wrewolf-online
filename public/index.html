@@ -196,7 +196,7 @@
                 <option value="0">Off</option>
               </select>
             </div>
-            <div class="border-t border-hairline pt-3 space-y-2">
+            <div class="border-t border-hairline pt-3 space-y-1 max-h-64 overflow-y-auto pr-1">
               <p class="text-xs text-mist2 mb-1">Special roles</p>
               <label class="flex items-center justify-between text-sm py-1 cursor-pointer">
                 <span class="flex items-center gap-2"><span class="text-seer">◆</span> Seer</span>
@@ -214,7 +214,40 @@
                 <span class="flex items-center gap-2"><span class="text-moon">◆</span> Cupid</span>
                 <input type="checkbox" id="setting-cupid" class="w-4 h-4" />
               </label>
+              <label class="flex items-center justify-between text-sm py-1 cursor-pointer">
+                <span class="flex items-center gap-2"><span class="text-wolfeye">◆</span> Minion</span>
+                <input type="checkbox" id="setting-minion" class="w-4 h-4" />
+              </label>
+              <label class="flex items-center justify-between text-sm py-1 cursor-pointer">
+                <span class="flex items-center gap-2"><span class="text-mist">◆</span> Masons (pair)</span>
+                <input type="checkbox" id="setting-masons" class="w-4 h-4" />
+              </label>
+              <label class="flex items-center justify-between text-sm py-1 cursor-pointer">
+                <span class="flex items-center gap-2"><span class="text-seer">◆</span> Robber</span>
+                <input type="checkbox" id="setting-robber" class="w-4 h-4" />
+              </label>
+              <label class="flex items-center justify-between text-sm py-1 cursor-pointer">
+                <span class="flex items-center gap-2"><span class="text-seer">◆</span> Troublemaker</span>
+                <input type="checkbox" id="setting-troublemaker" class="w-4 h-4" />
+              </label>
+              <label class="flex items-center justify-between text-sm py-1 cursor-pointer">
+                <span class="flex items-center gap-2"><span class="text-witch">◆</span> Drunk</span>
+                <input type="checkbox" id="setting-drunk" class="w-4 h-4" />
+              </label>
+              <label class="flex items-center justify-between text-sm py-1 cursor-pointer">
+                <span class="flex items-center gap-2"><span class="text-mist">◆</span> Insomniac</span>
+                <input type="checkbox" id="setting-insomniac" class="w-4 h-4" />
+              </label>
+              <label class="flex items-center justify-between text-sm py-1 cursor-pointer">
+                <span class="flex items-center gap-2"><span class="text-moon">◆</span> Tanner</span>
+                <input type="checkbox" id="setting-tanner" class="w-4 h-4" />
+              </label>
+              <label class="flex items-center justify-between text-sm py-1 cursor-pointer">
+                <span class="flex items-center gap-2"><span class="text-witch">◆</span> Medic</span>
+                <input type="checkbox" id="setting-medic" class="w-4 h-4" />
+              </label>
             </div>
+            <p id="role-count-warning" class="text-xs text-moon hidden mt-2"></p>
           </div>
           <div id="lobby-settings-guest" class="hidden text-sm text-mist2 space-y-2"></div>
         </div>
@@ -350,10 +383,16 @@
   const ROLE_COLORS = {
     werewolf: 'text-wolfeye', villager: 'text-mist', seer: 'text-seer',
     witch: 'text-witch', hunter: 'text-blood', cupid: 'text-moon',
+    minion: 'text-wolfeye', mason: 'text-mist', robber: 'text-seer',
+    troublemaker: 'text-seer', drunk: 'text-witch', insomniac: 'text-mist',
+    tanner: 'text-moon', medic: 'text-witch',
   };
   const ROLE_LABELS = {
     werewolf: 'Werewolf', villager: 'Villager', seer: 'Seer',
     witch: 'Witch', hunter: 'Hunter', cupid: 'Cupid',
+    minion: 'Minion', mason: 'Mason', robber: 'Robber',
+    troublemaker: 'Troublemaker', drunk: 'Drunk', insomniac: 'Insomniac',
+    tanner: 'Tanner', medic: 'Medic',
   };
 
   // ---------------------------------------------------------------------
@@ -422,23 +461,54 @@
     document.getElementById('wolf-count-label').textContent = wolfSlider.value;
     pushSettings();
   });
-  ['setting-timer','setting-seer','setting-witch','setting-hunter','setting-cupid'].forEach((id) => {
+  const ROLE_CHECKBOX_IDS = [
+    'setting-timer','setting-seer','setting-witch','setting-hunter','setting-cupid',
+    'setting-minion','setting-masons','setting-robber','setting-troublemaker',
+    'setting-drunk','setting-insomniac','setting-tanner','setting-medic',
+  ];
+  ROLE_CHECKBOX_IDS.forEach((id) => {
     document.getElementById(id).addEventListener('change', pushSettings);
   });
 
   function pushSettings() {
     if (!isHost) return;
+    const werewolves = parseInt(wolfSlider.value);
+    updateRoleCountWarning(werewolves);
     socket.emit('updateSettings', {
       code: roomCode,
       settings: {
-        werewolves: parseInt(wolfSlider.value),
+        werewolves,
         seer: document.getElementById('setting-seer').checked,
         witch: document.getElementById('setting-witch').checked,
         hunter: document.getElementById('setting-hunter').checked,
         cupid: document.getElementById('setting-cupid').checked,
+        minion: document.getElementById('setting-minion').checked,
+        masons: document.getElementById('setting-masons').checked,
+        robber: document.getElementById('setting-robber').checked,
+        troublemaker: document.getElementById('setting-troublemaker').checked,
+        drunk: document.getElementById('setting-drunk').checked,
+        insomniac: document.getElementById('setting-insomniac').checked,
+        tanner: document.getElementById('setting-tanner').checked,
+        medic: document.getElementById('setting-medic').checked,
         discussionSeconds: parseInt(document.getElementById('setting-timer').value),
       },
     });
+  }
+
+  function updateRoleCountWarning(werewolves) {
+    const warn = document.getElementById('role-count-warning');
+    let total = werewolves;
+    ['seer','witch','hunter','cupid','minion','robber','troublemaker','drunk','insomniac','tanner','medic'].forEach((id) => {
+      if (document.getElementById('setting-' + id).checked) total += 1;
+    });
+    if (document.getElementById('setting-masons').checked) total += 2;
+    const playerCount = lastRoomState ? lastRoomState.players.length : 0;
+    if (playerCount && total > playerCount) {
+      warn.textContent = `You've enabled ${total} roles for ${playerCount} players — some may be randomly left out.`;
+      warn.classList.remove('hidden');
+    } else {
+      warn.classList.add('hidden');
+    }
   }
 
   document.getElementById('btn-start-game').addEventListener('click', () => {
@@ -484,10 +554,10 @@
       wolfSlider.value = settings.werewolves;
       document.getElementById('wolf-count-label').textContent = settings.werewolves;
       document.getElementById('setting-timer').value = String(settings.discussionSeconds);
-      document.getElementById('setting-seer').checked = settings.seer;
-      document.getElementById('setting-witch').checked = settings.witch;
-      document.getElementById('setting-hunter').checked = settings.hunter;
-      document.getElementById('setting-cupid').checked = settings.cupid;
+      ['seer','witch','hunter','cupid','minion','masons','robber','troublemaker','drunk','insomniac','tanner','medic'].forEach((id) => {
+        document.getElementById('setting-' + id).checked = !!settings[id];
+      });
+      updateRoleCountWarning(settings.werewolves);
 
       const startBtn = document.getElementById('btn-start-game');
       const enough = state.players.length >= 4;
@@ -497,10 +567,16 @@
       document.getElementById('lobby-settings-host').classList.add('hidden');
       const guest = document.getElementById('lobby-settings-guest');
       guest.classList.remove('hidden');
+      const roleLabelMap = {
+        seer: 'Seer', witch: 'Witch', hunter: 'Hunter', cupid: 'Cupid', minion: 'Minion',
+        masons: 'Masons (x2)', robber: 'Robber', troublemaker: 'Troublemaker', drunk: 'Drunk',
+        insomniac: 'Insomniac', tanner: 'Tanner', medic: 'Medic',
+      };
+      const activeRoles = Object.keys(roleLabelMap).filter((k) => settings[k]).map((k) => roleLabelMap[k]);
       guest.innerHTML = `
         <p>🐺 Werewolves: <span class="text-moon2">${settings.werewolves}</span></p>
         <p>⏱ Discussion: <span class="text-moon2">${settings.discussionSeconds ? settings.discussionSeconds + 's' : 'off'}</span></p>
-        <p>Roles: <span class="text-moon2">${['seer && Seer','witch && Witch','hunter && Hunter','cupid && Cupid'].map(pair=>{const [k,l]=pair.split(' && '); return settings[k] ? l : null;}).filter(Boolean).join(', ') || 'none'}</span></p>
+        <p>Roles: <span class="text-moon2">${activeRoles.join(', ') || 'none'}</span></p>
       `;
       document.getElementById('btn-start-game').classList.add('hidden');
       document.getElementById('lobby-hint').textContent = 'Waiting for the host to start the game...';
@@ -525,14 +601,38 @@
     document.getElementById('reveal-instructions').textContent = data.instructions;
 
     const wolfBox = document.getElementById('reveal-wolfteam');
-    if (data.wolfTeammates && data.wolfTeammates.length) {
+    const extraNames = data.wolfTeammates || data.werewolfNames || data.masonTeammates;
+    const extraLabel = data.wolfTeammates ? 'Your fellow werewolves'
+      : data.werewolfNames ? 'The werewolves are'
+      : data.masonTeammates ? 'Your fellow Mason(s)' : null;
+    if (extraNames && extraNames.length) {
       wolfBox.classList.remove('hidden');
-      document.getElementById('reveal-wolfteam-list').innerHTML = data.wolfTeammates
+      wolfBox.querySelector('p').textContent = extraLabel;
+      document.getElementById('reveal-wolfteam-list').innerHTML = extraNames
         .map((n) => `<span class="bg-panel2 border border-wolfeye/40 text-wolfeye rounded-full px-3 py-1 text-xs">${escapeHtml(n)}</span>`).join('');
+    } else if (data.masonTeammates) {
+      wolfBox.classList.remove('hidden');
+      wolfBox.querySelector('p').textContent = 'No other Masons this game';
+      document.getElementById('reveal-wolfteam-list').innerHTML = '';
     } else {
       wolfBox.classList.add('hidden');
     }
     show('screen-reveal');
+  });
+
+  socket.on('roleUpdated', (data) => {
+    // Fired for the Robber right after they steal a role — updates their
+    // private role-reveal-style info without re-showing the whole screen.
+    myRole = data.role;
+    const panel = document.getElementById('night-panel');
+    if (panel) {
+      panel.innerHTML = `
+        <div class="text-center py-6">
+          <p class="text-xs uppercase tracking-widest text-mist2 mb-2">You are now the...</p>
+          <p class="font-display text-2xl mb-2 ${ROLE_COLORS[data.role] || 'text-moon2'}">${escapeHtml(data.label)}</p>
+          <p class="text-mist text-sm">${escapeHtml(data.instructions)}</p>
+        </div>`;
+    }
   });
 
   // ---------------------------------------------------------------------
@@ -554,7 +654,17 @@
     }
 
     if (data.action === 'wait') {
-      const stepLabel = { cupid: "Cupid is choosing lovers...", wolves: "The werewolves are hunting...", seer: "The Seer is peering into the dark...", witch: "The Witch weighs her potions..." }[data.step] || 'Waiting...';
+      const stepLabel = {
+        cupid: "Cupid is choosing lovers...",
+        robber: "The Robber is stealing a life...",
+        troublemaker: "The Troublemaker is stirring things up...",
+        drunk: "The Drunk stumbles toward a mystery card...",
+        insomniac: "The Insomniac tosses and turns...",
+        wolves: "The werewolves are hunting...",
+        seer: "The Seer is peering into the dark...",
+        medic: "The Medic is choosing who to protect...",
+        witch: "The Witch weighs her potions...",
+      }[data.step] || 'Waiting...';
       subtitle.textContent = stepLabel;
       panel.innerHTML = `
         <div class="flex flex-col items-center justify-center py-10 text-center">
@@ -583,6 +693,92 @@
       document.getElementById('cupid-confirm').addEventListener('click', () => {
         socket.emit('cupidChoose', { code: roomCode, targets: [...chosen] });
         panel.innerHTML = `<p class="text-center text-mist2 text-sm py-10">Lovers chosen. Waiting for the night to continue...</p>`;
+      });
+      return;
+    }
+
+    if (data.action === 'robber') {
+      subtitle.textContent = 'Steal another player\'s role.';
+      panel.innerHTML = `<p class="text-xs text-mist2 mb-3">You\u2019ll instantly become whatever they are.</p><div id="robber-list" class="grid grid-cols-2 gap-2"></div>`;
+      const listEl = document.getElementById('robber-list');
+      data.options.forEach((o) => {
+        const chip = document.createElement('button');
+        chip.className = 'player-chip selectable bg-panel2 border border-hairline rounded-lg px-3 py-2 text-sm text-left';
+        chip.textContent = o.name;
+        chip.addEventListener('click', () => {
+          socket.emit('robberSwap', { code: roomCode, targetId: o.id });
+        });
+        listEl.appendChild(chip);
+      });
+      return;
+    }
+
+    if (data.action === 'troublemaker') {
+      subtitle.textContent = 'Swap the roles of two other players.';
+      panel.innerHTML = `<p class="text-xs text-mist2 mb-3">Pick exactly two — you won\u2019t see what they become.</p><div id="tm-list" class="grid grid-cols-2 gap-2 mb-4"></div><button id="tm-confirm" disabled class="w-full bg-blood disabled:opacity-40 text-white py-2 rounded-lg font-semibold text-sm">Confirm Swap</button>`;
+      const listEl = document.getElementById('tm-list');
+      const chosen = new Set();
+      data.options.forEach((o) => {
+        const chip = document.createElement('button');
+        chip.className = 'player-chip selectable bg-panel2 border border-hairline rounded-lg px-3 py-2 text-sm text-left';
+        chip.textContent = o.name;
+        chip.addEventListener('click', () => {
+          if (chosen.has(o.id)) { chosen.delete(o.id); chip.classList.remove('selected'); }
+          else if (chosen.size < 2) { chosen.add(o.id); chip.classList.add('selected'); }
+          document.getElementById('tm-confirm').disabled = chosen.size !== 2;
+        });
+        listEl.appendChild(chip);
+      });
+      document.getElementById('tm-confirm').addEventListener('click', () => {
+        const [a, b] = [...chosen];
+        socket.emit('troublemakerSwap', { code: roomCode, targetAId: a, targetBId: b });
+        panel.innerHTML = `<p class="text-center text-mist2 text-sm py-10">Done. Waiting for the night to continue...</p>`;
+      });
+      return;
+    }
+
+    if (data.action === 'drunk') {
+      subtitle.textContent = 'Swap your role with a hidden card.';
+      panel.innerHTML = `
+        <div class="text-center py-6">
+          <p class="text-mist text-sm mb-4">You won\u2019t know what you become until the game ends.</p>
+          <button id="drunk-confirm" class="bg-blood hover:bg-blood2 text-white px-6 py-2 rounded-lg font-semibold text-sm">Swap with the mystery card</button>
+        </div>`;
+      document.getElementById('drunk-confirm').addEventListener('click', () => {
+        socket.emit('drunkSwap', { code: roomCode });
+        panel.innerHTML = `<p class="text-center text-mist2 text-sm py-10">The swap is made. You have no idea what you are now...</p>`;
+      });
+      return;
+    }
+
+    if (data.action === 'insomniac') {
+      subtitle.textContent = 'Check your current role.';
+      panel.innerHTML = `
+        <div class="text-center py-6">
+          <p class="text-xs uppercase tracking-widest text-mist2 mb-2">You wake up and check — you are currently the...</p>
+          <p class="font-display text-2xl text-moon2 mb-5">${escapeHtml(data.currentRole)}</p>
+          <button id="insomniac-confirm" class="bg-panel2 border border-hairline hover:border-moon px-6 py-2 rounded-lg text-sm">Go back to sleep</button>
+        </div>`;
+      document.getElementById('insomniac-confirm').addEventListener('click', () => {
+        socket.emit('insomniacDone', { code: roomCode });
+        panel.innerHTML = `<p class="text-center text-mist2 text-sm py-10">Waiting for the night to continue...</p>`;
+      });
+      return;
+    }
+
+    if (data.action === 'medic') {
+      subtitle.textContent = 'Choose someone to protect tonight.';
+      panel.innerHTML = `<p class="text-xs text-mist2 mb-3">You can\u2019t protect the same person two nights in a row.</p><div id="medic-list" class="grid grid-cols-2 gap-2"></div>`;
+      const listEl = document.getElementById('medic-list');
+      data.options.forEach((o) => {
+        const chip = document.createElement('button');
+        chip.className = 'player-chip selectable bg-panel2 border border-hairline rounded-lg px-3 py-2 text-sm text-left';
+        chip.textContent = o.name;
+        chip.addEventListener('click', () => {
+          socket.emit('medicProtect', { code: roomCode, targetId: o.id });
+          panel.innerHTML = `<p class="text-center text-mist2 text-sm py-10">${escapeHtml(o.name)} is under your protection tonight.</p>`;
+        });
+        listEl.appendChild(chip);
       });
       return;
     }
@@ -849,6 +1045,9 @@
     if (data.winner === 'villagers') {
       title.textContent = 'The Village Wins';
       title.className = 'font-display text-4xl mb-2 text-seer';
+    } else if (data.winner === 'tanner') {
+      title.textContent = `The Tanner Wins`;
+      title.className = 'font-display text-4xl mb-2 text-moon';
     } else {
       title.textContent = 'The Werewolves Win';
       title.className = 'font-display text-4xl mb-2 text-wolfeye';
