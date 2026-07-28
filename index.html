@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+<title>Hollow — Online Werewolf</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          void: '#0A0B14',
+          dusk: '#12142280',
+          panel: '#161829',
+          panel2: '#1D2036',
+          hairline: '#2B2E4A',
+          mist: '#9CA3C4',
+          mist2: '#6B7099',
+          blood: '#B93B4C',
+          blood2: '#8C2836',
+          moon: '#E8C468',
+          moon2: '#F5DFA0',
+          wolfeye: '#E2453B',
+          seer: '#6FA5C9',
+          witch: '#8E6FC9',
+        },
+        fontFamily: {
+          display: ['Cinzel', 'serif'],
+          body: ['Inter', 'sans-serif'],
+          mono: ['JetBrains Mono', 'monospace'],
+        },
+      },
+    },
+  };
+</script>
+<style>
+  html, body { background: #0A0B14; }
+  body { font-family: 'Inter', sans-serif; }
+  .font-display { font-family: 'Cinzel', serif; letter-spacing: 0.02em; }
+  .screen { display: none; }
+  .screen.active { display: block; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #2B2E4A; border-radius: 4px; }
+  :focus-visible { outline: 2px solid #E8C468; outline-offset: 2px; }
+
+  /* Ambient background: faint stars + vignette */
+  .bg-stars {
+    background-image:
+      radial-gradient(1px 1px at 10% 20%, rgba(232,196,104,0.35) 0, transparent 50%),
+      radial-gradient(1px 1px at 80% 10%, rgba(232,196,104,0.25) 0, transparent 50%),
+      radial-gradient(1px 1px at 60% 70%, rgba(156,163,196,0.3) 0, transparent 50%),
+      radial-gradient(1.5px 1.5px at 30% 80%, rgba(232,196,104,0.3) 0, transparent 50%),
+      radial-gradient(1px 1px at 90% 60%, rgba(156,163,196,0.25) 0, transparent 50%),
+      radial-gradient(1px 1px at 45% 35%, rgba(232,196,104,0.2) 0, transparent 50%);
+    background-repeat: no-repeat;
+  }
+
+  /* Signature element: the Moon — a single circle whose clip mask represents day/night phase */
+  .moon-wrap { position: relative; width: 84px; height: 84px; }
+  .moon-body {
+    width: 100%; height: 100%; border-radius: 9999px;
+    background: radial-gradient(circle at 35% 30%, #F5DFA0 0%, #E8C468 45%, #C9A24E 100%);
+    box-shadow: 0 0 40px 6px rgba(232,196,104,0.35), inset -8px -6px 16px rgba(0,0,0,0.25);
+    transition: box-shadow 1.2s ease;
+  }
+  .moon-wrap.is-night .moon-body {
+    background: radial-gradient(circle at 35% 30%, #3B3F63 0%, #262A46 55%, #14162A 100%);
+    box-shadow: 0 0 34px 10px rgba(140,40,54,0.35), inset -6px -6px 14px rgba(0,0,0,0.5);
+  }
+  .moon-wrap.is-night .moon-body::after {
+    content: ''; position: absolute; inset: 0; border-radius: 9999px;
+    background: radial-gradient(circle at 65% 55%, rgba(226,69,59,0.55), transparent 55%);
+  }
+  .moon-crater { position: absolute; border-radius: 9999px; background: rgba(0,0,0,0.12); }
+
+  .pulse-ring { animation: pulseRing 2.4s ease-out infinite; }
+  @keyframes pulseRing {
+    0% { box-shadow: 0 0 0 0 rgba(232,196,104,0.35); }
+    100% { box-shadow: 0 0 0 14px rgba(232,196,104,0); }
+  }
+
+  .card-enter { animation: cardEnter 0.4s ease both; }
+  @keyframes cardEnter { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+  .role-card {
+    background: radial-gradient(120% 140% at 50% -10%, rgba(232,196,104,0.12), transparent 60%), #161829;
+  }
+
+  .player-chip { transition: transform .15s ease, border-color .15s ease; }
+  .player-chip:hover { transform: translateY(-1px); }
+  .player-chip.selectable:hover { border-color: #E8C468; }
+  .player-chip.selected { border-color: #E8C468 !important; background: rgba(232,196,104,0.08); }
+
+  input[type="range"] { accent-color: #B93B4C; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pulse-ring, .card-enter { animation: none !important; }
+  }
+</style>
+</head>
+<body class="bg-void text-mist min-h-screen bg-stars">
+
+<div class="min-h-screen flex flex-col">
+
+  <!-- Top bar -->
+  <header class="border-b border-hairline/60 px-5 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-7 h-7 rounded-full" style="background: radial-gradient(circle at 35% 30%, #F5DFA0, #C9A24E);"></div>
+      <span class="font-display text-lg tracking-wide text-moon2">HOLLOW</span>
+    </div>
+    <div id="room-code-badge" class="hidden items-center gap-2 font-mono text-sm text-mist2">
+      <span>Room</span>
+      <span id="room-code-text" class="text-moon2 font-semibold tracking-widest bg-panel2 border border-hairline rounded px-2 py-1"></span>
+    </div>
+  </header>
+
+  <main class="flex-1 flex items-center justify-center p-4">
+
+    <!-- ============ SCREEN: LANDING ============ -->
+    <section id="screen-landing" class="screen active w-full max-w-md card-enter">
+      <div class="text-center mb-8">
+        <div class="moon-wrap mx-auto mb-5"><div class="moon-body"></div></div>
+        <h1 class="font-display text-3xl text-moon2 mb-2">A village sleeps. Something hunts.</h1>
+        <p class="text-mist2 text-sm">Play Werewolf online with friends — no app, just a room code.</p>
+      </div>
+      <div class="space-y-3">
+        <button id="btn-goto-create" class="w-full bg-blood hover:bg-blood2 transition text-white font-semibold py-3 rounded-lg border border-blood2 font-display tracking-wide">Host a Game</button>
+        <button id="btn-goto-join" class="w-full bg-panel hover:bg-panel2 transition text-mist font-semibold py-3 rounded-lg border border-hairline font-display tracking-wide">Join a Game</button>
+      </div>
+    </section>
+
+    <!-- ============ SCREEN: CREATE ============ -->
+    <section id="screen-create" class="screen w-full max-w-md card-enter">
+      <button data-back="screen-landing" class="text-mist2 text-sm mb-4 hover:text-mist">&larr; Back</button>
+      <div class="bg-panel border border-hairline rounded-xl p-6">
+        <h2 class="font-display text-xl text-moon2 mb-4">Host a Game</h2>
+        <label class="block text-sm text-mist2 mb-2">Your name</label>
+        <input id="create-name" maxlength="20" placeholder="e.g. Marina" class="w-full bg-panel2 border border-hairline rounded-lg px-4 py-3 mb-4 text-mist placeholder:text-mist2/60" />
+        <button id="btn-create-room" class="w-full bg-blood hover:bg-blood2 transition text-white font-semibold py-3 rounded-lg font-display tracking-wide">Create Room</button>
+        <p id="create-error" class="text-wolfeye text-sm mt-3 hidden"></p>
+      </div>
+    </section>
+
+    <!-- ============ SCREEN: JOIN ============ -->
+    <section id="screen-join" class="screen w-full max-w-md card-enter">
+      <button data-back="screen-landing" class="text-mist2 text-sm mb-4 hover:text-mist">&larr; Back</button>
+      <div class="bg-panel border border-hairline rounded-xl p-6">
+        <h2 class="font-display text-xl text-moon2 mb-4">Join a Game</h2>
+        <label class="block text-sm text-mist2 mb-2">Room code</label>
+        <input id="join-code" maxlength="6" placeholder="ABCDE" class="w-full bg-panel2 border border-hairline rounded-lg px-4 py-3 mb-4 uppercase tracking-[0.3em] text-center font-mono text-lg text-moon2 placeholder:text-mist2/60" />
+        <label class="block text-sm text-mist2 mb-2">Your name</label>
+        <input id="join-name" maxlength="20" placeholder="e.g. Theo" class="w-full bg-panel2 border border-hairline rounded-lg px-4 py-3 mb-4 text-mist placeholder:text-mist2/60" />
+        <button id="btn-join-room" class="w-full bg-blood hover:bg-blood2 transition text-white font-semibold py-3 rounded-lg font-display tracking-wide">Join Room</button>
+        <p id="join-error" class="text-wolfeye text-sm mt-3 hidden"></p>
+      </div>
+    </section>
+
+    <!-- ============ SCREEN: LOBBY ============ -->
+    <section id="screen-lobby" class="screen w-full max-w-2xl card-enter">
+      <div class="text-center mb-6">
+        <p class="text-mist2 text-sm mb-1">Share this code with your friends</p>
+        <div class="font-mono text-4xl tracking-[0.4em] text-moon2 font-bold">
+          <span id="lobby-code">-----</span>
+        </div>
+      </div>
+
+      <div class="grid md:grid-cols-2 gap-4">
+        <!-- Player list -->
+        <div class="bg-panel border border-hairline rounded-xl p-5">
+          <h3 class="font-display text-moon2 mb-3 flex items-center justify-between">
+            <span>Players</span>
+            <span id="lobby-count" class="text-xs text-mist2 font-body font-normal">0 / needs 4+</span>
+          </h3>
+          <ul id="lobby-players" class="space-y-2 max-h-72 overflow-y-auto pr-1"></ul>
+        </div>
+
+        <!-- Settings (host only) -->
+        <div class="bg-panel border border-hairline rounded-xl p-5">
+          <h3 class="font-display text-moon2 mb-3">Settings</h3>
+          <div id="lobby-settings-host" class="space-y-4">
+            <div>
+              <div class="flex justify-between text-sm mb-1"><span>Werewolves</span><span id="wolf-count-label" class="text-moon2 font-semibold">1</span></div>
+              <input id="setting-wolves" type="range" min="1" max="6" value="1" class="w-full" />
+            </div>
+            <div class="flex items-center justify-between">
+              <span class="text-sm">Discussion timer</span>
+              <select id="setting-timer" class="bg-panel2 border border-hairline rounded px-2 py-1 text-sm">
+                <option value="60">60s</option>
+                <option value="90" selected>90s</option>
+                <option value="120">120s</option>
+                <option value="180">180s</option>
+                <option value="0">Off</option>
+              </select>
+            </div>
+            <div class="border-t border-hairline pt-3 space-y-2">
+              <p class="text-xs text-mist2 mb-1">Special roles</p>
+              <label class="flex items-center justify-between text-sm py-1 cursor-pointer">
+                <span class="flex items-center gap-2"><span class="text-seer">◆</span> Seer</span>
+                <input type="checkbox" id="setting-seer" checked class="w-4 h-4" />
+              </label>
+              <label class="flex items-center justify-between text-sm py-1 cursor-pointer">
+                <span class="flex items-center gap-2"><span class="text-witch">◆</span> Witch</span>
+                <input type="checkbox" id="setting-witch" checked class="w-4 h-4" />
+              </label>
+              <label class="flex items-center justify-between text-sm py-1 cursor-pointer">
+                <span class="flex items-center gap-2"><span class="text-blood">◆</span> Hunter</span>
+                <input type="checkbox" id="setting-hunter" checked class="w-4 h-4" />
+              </label>
+              <label class="flex items-center justify-between text-sm py-1 cursor-pointer">
+                <span class="flex items-center gap-2"><span class="text-moon">◆</span> Cupid</span>
+                <input type="checkbox" id="setting-cupid" class="w-4 h-4" />
+              </label>
+            </div>
+          </div>
+          <div id="lobby-settings-guest" class="hidden text-sm text-mist2 space-y-2"></div>
+        </div>
+      </div>
+
+      <div class="mt-5">
+        <button id="btn-start-game" disabled class="w-full bg-blood hover:bg-blood2 disabled:opacity-40 disabled:cursor-not-allowed transition text-white font-semibold py-3 rounded-lg font-display tracking-wide">
+          Start Game
+        </button>
+        <p id="lobby-hint" class="text-center text-xs text-mist2 mt-2">Waiting for the host to start...</p>
+      </div>
+    </section>
+
+    <!-- ============ SCREEN: ROLE REVEAL ============ -->
+    <section id="screen-reveal" class="screen w-full max-w-md card-enter">
+      <div class="role-card border border-hairline rounded-2xl p-8 text-center">
+        <p class="text-xs uppercase tracking-[0.3em] text-mist2 mb-3">Your secret role</p>
+        <h2 id="reveal-role-name" class="font-display text-3xl text-moon2 mb-2">—</h2>
+        <p id="reveal-team" class="text-sm mb-5"></p>
+        <p id="reveal-instructions" class="text-mist text-sm leading-relaxed"></p>
+        <div id="reveal-wolfteam" class="mt-5 hidden">
+          <p class="text-xs uppercase tracking-widest text-wolfeye mb-2">Your fellow werewolves</p>
+          <div id="reveal-wolfteam-list" class="flex flex-wrap justify-center gap-2"></div>
+        </div>
+        <p class="text-mist2 text-xs mt-6">Night falls shortly...</p>
+      </div>
+    </section>
+
+    <!-- ============ SCREEN: NIGHT ============ -->
+    <section id="screen-night" class="screen w-full max-w-lg card-enter">
+      <div class="text-center mb-6">
+        <div class="moon-wrap is-night mx-auto mb-3"><div class="moon-body"></div></div>
+        <h2 class="font-display text-2xl text-moon2">Night <span id="night-number">1</span></h2>
+        <p id="night-subtitle" class="text-mist2 text-sm mt-1">The village sleeps...</p>
+      </div>
+
+      <div class="bg-panel border border-hairline rounded-xl p-5 min-h-[220px]" id="night-panel">
+        <!-- populated dynamically -->
+      </div>
+
+      <div class="mt-4">
+        <p class="text-xs text-center text-mist2">Alive: <span id="night-alive-count">-</span> players</p>
+      </div>
+    </section>
+
+    <!-- ============ SCREEN: DAY ANNOUNCE ============ -->
+    <section id="screen-announce" class="screen w-full max-w-lg card-enter">
+      <div class="text-center mb-6">
+        <div class="moon-wrap mx-auto mb-3"><div class="moon-body"></div></div>
+        <h2 class="font-display text-2xl text-moon2">Dawn breaks</h2>
+      </div>
+      <div id="announce-panel" class="bg-panel border border-hairline rounded-xl p-6 text-center"></div>
+    </section>
+
+    <!-- ============ SCREEN: HUNTER SHOT ============ -->
+    <section id="screen-hunter" class="screen w-full max-w-lg card-enter">
+      <div class="text-center mb-4">
+        <h2 class="font-display text-2xl text-blood">The Hunter's Last Shot</h2>
+      </div>
+      <div class="bg-panel border border-blood2 rounded-xl p-5">
+        <p id="hunter-message" class="text-sm text-mist mb-4">Take one more soul with you.</p>
+        <div id="hunter-options" class="space-y-2"></div>
+      </div>
+    </section>
+
+    <!-- ============ SCREEN: DAY DISCUSS ============ -->
+    <section id="screen-discuss" class="screen w-full max-w-2xl card-enter">
+      <div class="text-center mb-5">
+        <h2 class="font-display text-2xl text-moon2">Discussion</h2>
+        <p class="text-mist2 text-sm">Debate who among you is a werewolf.</p>
+        <div id="discuss-timer" class="font-mono text-3xl text-moon2 mt-3">--:--</div>
+      </div>
+      <div class="bg-panel border border-hairline rounded-xl p-5">
+        <h3 class="font-display text-sm text-mist2 mb-3">Players</h3>
+        <ul id="discuss-players" class="grid grid-cols-2 gap-2"></ul>
+      </div>
+      <button id="btn-skip-discuss" class="hidden mt-4 w-full bg-panel2 hover:bg-hairline transition text-mist font-semibold py-2 rounded-lg text-sm">Host: Skip to Vote</button>
+    </section>
+
+    <!-- ============ SCREEN: DAY VOTE ============ -->
+    <section id="screen-vote" class="screen w-full max-w-lg card-enter">
+      <div class="text-center mb-5">
+        <h2 class="font-display text-2xl text-moon2">Cast Your Vote</h2>
+        <p id="vote-status" class="text-mist2 text-sm">Choose who to eliminate.</p>
+      </div>
+      <div id="vote-options" class="space-y-2"></div>
+      <div id="vote-spectator" class="hidden text-center text-mist2 text-sm bg-panel border border-hairline rounded-xl p-5">
+        You have been eliminated and are now spectating. The living are voting.
+      </div>
+    </section>
+
+    <!-- ============ SCREEN: DAY RESULT ============ -->
+    <section id="screen-result" class="screen w-full max-w-lg card-enter">
+      <div class="text-center mb-4">
+        <h2 class="font-display text-2xl text-moon2">The Verdict</h2>
+      </div>
+      <div id="result-panel" class="bg-panel border border-hairline rounded-xl p-6 text-center"></div>
+    </section>
+
+    <!-- ============ SCREEN: GAME OVER ============ -->
+    <section id="screen-gameover" class="screen w-full max-w-2xl card-enter">
+      <div class="text-center mb-6">
+        <h2 id="gameover-title" class="font-display text-4xl mb-2">—</h2>
+        <p class="text-mist2 text-sm">All roles revealed</p>
+      </div>
+      <div class="bg-panel border border-hairline rounded-xl p-5 mb-5">
+        <ul id="gameover-roles" class="grid sm:grid-cols-2 gap-2"></ul>
+      </div>
+      <button id="btn-play-again" class="hidden w-full bg-blood hover:bg-blood2 transition text-white font-semibold py-3 rounded-lg font-display tracking-wide">Play Again</button>
+      <p id="gameover-wait" class="text-center text-xs text-mist2 mt-2">Waiting for the host to restart...</p>
+    </section>
+
+  </main>
+
+  <footer class="text-center text-xs text-mist2/60 py-3">Hollow &middot; an online Werewolf party game</footer>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+(function () {
+  const socket = io();
+
+  // ---------------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------------
+  let myId = null;
+  let roomCode = null;
+  let isHost = false;
+  let myRole = null;
+  let lastRoomState = null;
+  let discussionInterval = null;
+
+  const ROLE_COLORS = {
+    werewolf: 'text-wolfeye', villager: 'text-mist', seer: 'text-seer',
+    witch: 'text-witch', hunter: 'text-blood', cupid: 'text-moon',
+  };
+  const ROLE_LABELS = {
+    werewolf: 'Werewolf', villager: 'Villager', seer: 'Seer',
+    witch: 'Witch', hunter: 'Hunter', cupid: 'Cupid',
+  };
+
+  // ---------------------------------------------------------------------
+  // Screen helpers
+  // ---------------------------------------------------------------------
+  function show(id) {
+    document.querySelectorAll('.screen').forEach((s) => s.classList.remove('active'));
+    document.getElementById(id).classList.add('active');
+  }
+
+  document.querySelectorAll('[data-back]').forEach((btn) => {
+    btn.addEventListener('click', () => show(btn.dataset.back));
+  });
+
+  function setRoomBadge(code) {
+    const badge = document.getElementById('room-code-badge');
+    if (code) {
+      badge.classList.remove('hidden');
+      badge.classList.add('flex');
+      document.getElementById('room-code-text').textContent = code;
+    } else {
+      badge.classList.add('hidden');
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Landing / Create / Join
+  // ---------------------------------------------------------------------
+  document.getElementById('btn-goto-create').addEventListener('click', () => show('screen-create'));
+  document.getElementById('btn-goto-join').addEventListener('click', () => show('screen-join'));
+
+  document.getElementById('btn-create-room').addEventListener('click', () => {
+    const name = document.getElementById('create-name').value.trim();
+    const errEl = document.getElementById('create-error');
+    errEl.classList.add('hidden');
+    if (!name) { errEl.textContent = 'Please enter your name.'; errEl.classList.remove('hidden'); return; }
+    socket.emit('createRoom', { name }, (res) => {
+      if (!res.success) { errEl.textContent = res.error || 'Could not create room.'; errEl.classList.remove('hidden'); return; }
+      roomCode = res.code; myId = socket.id; isHost = true;
+      setRoomBadge(roomCode);
+      document.getElementById('lobby-code').textContent = roomCode;
+      show('screen-lobby');
+    });
+  });
+
+  document.getElementById('btn-join-room').addEventListener('click', () => {
+    const code = document.getElementById('join-code').value.trim().toUpperCase();
+    const name = document.getElementById('join-name').value.trim();
+    const errEl = document.getElementById('join-error');
+    errEl.classList.add('hidden');
+    if (!code || !name) { errEl.textContent = 'Please enter both a room code and your name.'; errEl.classList.remove('hidden'); return; }
+    socket.emit('joinRoom', { code, name }, (res) => {
+      if (!res.success) { errEl.textContent = res.error || 'Could not join room.'; errEl.classList.remove('hidden'); return; }
+      roomCode = res.code; myId = socket.id; isHost = (res.hostId === socket.id);
+      setRoomBadge(roomCode);
+      document.getElementById('lobby-code').textContent = roomCode;
+      show('screen-lobby');
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // Lobby settings (host)
+  // ---------------------------------------------------------------------
+  const wolfSlider = document.getElementById('setting-wolves');
+  wolfSlider.addEventListener('input', () => {
+    document.getElementById('wolf-count-label').textContent = wolfSlider.value;
+    pushSettings();
+  });
+  ['setting-timer','setting-seer','setting-witch','setting-hunter','setting-cupid'].forEach((id) => {
+    document.getElementById(id).addEventListener('change', pushSettings);
+  });
+
+  function pushSettings() {
+    if (!isHost) return;
+    socket.emit('updateSettings', {
+      code: roomCode,
+      settings: {
+        werewolves: parseInt(wolfSlider.value),
+        seer: document.getElementById('setting-seer').checked,
+        witch: document.getElementById('setting-witch').checked,
+        hunter: document.getElementById('setting-hunter').checked,
+        cupid: document.getElementById('setting-cupid').checked,
+        discussionSeconds: parseInt(document.getElementById('setting-timer').value),
+      },
+    });
+  }
+
+  document.getElementById('btn-start-game').addEventListener('click', () => {
+    socket.emit('startGame', { code: roomCode });
+  });
+
+  // ---------------------------------------------------------------------
+  // roomUpdate — drives lobby, player lists everywhere, alive counts
+  // ---------------------------------------------------------------------
+  socket.on('roomUpdate', (state) => {
+    lastRoomState = state;
+    roomCode = state.code;
+    isHost = state.hostId === myId;
+    setRoomBadge(roomCode);
+
+    if (state.phase === 'lobby') {
+      renderLobby(state);
+      if (document.getElementById('screen-lobby').classList.contains('active') === false &&
+          !['screen-create','screen-join'].some(id => document.getElementById(id).classList.contains('active'))) {
+        show('screen-lobby');
+      }
+    }
+
+    renderDiscussPlayers(state);
+  });
+
+  function renderLobby(state) {
+    document.getElementById('lobby-code').textContent = state.code;
+    const list = document.getElementById('lobby-players');
+    list.innerHTML = '';
+    state.players.forEach((p) => {
+      const li = document.createElement('li');
+      li.className = 'player-chip flex items-center justify-between bg-panel2 border border-hairline rounded-lg px-3 py-2 text-sm';
+      li.innerHTML = `<span>${p.isHost ? '👑 ' : ''}${escapeHtml(p.name)}${p.id === myId ? ' <span class="text-mist2">(you)</span>' : ''}</span>`;
+      list.appendChild(li);
+    });
+    document.getElementById('lobby-count').textContent = `${state.players.length} / needs 4+`;
+
+    const settings = state.settings;
+    if (isHost) {
+      document.getElementById('lobby-settings-host').classList.remove('hidden');
+      document.getElementById('lobby-settings-guest').classList.add('hidden');
+      wolfSlider.value = settings.werewolves;
+      document.getElementById('wolf-count-label').textContent = settings.werewolves;
+      document.getElementById('setting-timer').value = String(settings.discussionSeconds);
+      document.getElementById('setting-seer').checked = settings.seer;
+      document.getElementById('setting-witch').checked = settings.witch;
+      document.getElementById('setting-hunter').checked = settings.hunter;
+      document.getElementById('setting-cupid').checked = settings.cupid;
+
+      const startBtn = document.getElementById('btn-start-game');
+      const enough = state.players.length >= 4;
+      startBtn.disabled = !enough;
+      document.getElementById('lobby-hint').textContent = enough ? '' : `Need at least 4 players (${state.players.length}/4).`;
+    } else {
+      document.getElementById('lobby-settings-host').classList.add('hidden');
+      const guest = document.getElementById('lobby-settings-guest');
+      guest.classList.remove('hidden');
+      guest.innerHTML = `
+        <p>🐺 Werewolves: <span class="text-moon2">${settings.werewolves}</span></p>
+        <p>⏱ Discussion: <span class="text-moon2">${settings.discussionSeconds ? settings.discussionSeconds + 's' : 'off'}</span></p>
+        <p>Roles: <span class="text-moon2">${['seer && Seer','witch && Witch','hunter && Hunter','cupid && Cupid'].map(pair=>{const [k,l]=pair.split(' && '); return settings[k] ? l : null;}).filter(Boolean).join(', ') || 'none'}</span></p>
+      `;
+      document.getElementById('btn-start-game').classList.add('hidden');
+      document.getElementById('lobby-hint').textContent = 'Waiting for the host to start the game...';
+    }
+  }
+
+  function escapeHtml(str) {
+    const d = document.createElement('div');
+    d.textContent = str;
+    return d.innerHTML;
+  }
+
+  // ---------------------------------------------------------------------
+  // Role reveal
+  // ---------------------------------------------------------------------
+  socket.on('roleAssigned', (data) => {
+    myRole = data.role;
+    document.getElementById('reveal-role-name').textContent = data.label;
+    document.getElementById('reveal-role-name').className = 'font-display text-3xl mb-2 ' + (ROLE_COLORS[data.role] || 'text-moon2');
+    document.getElementById('reveal-team').textContent = data.team === 'werewolves' ? 'Team: Werewolves' : 'Team: Villagers';
+    document.getElementById('reveal-team').className = 'text-sm mb-5 ' + (data.team === 'werewolves' ? 'text-wolfeye' : 'text-seer');
+    document.getElementById('reveal-instructions').textContent = data.instructions;
+
+    const wolfBox = document.getElementById('reveal-wolfteam');
+    if (data.wolfTeammates && data.wolfTeammates.length) {
+      wolfBox.classList.remove('hidden');
+      document.getElementById('reveal-wolfteam-list').innerHTML = data.wolfTeammates
+        .map((n) => `<span class="bg-panel2 border border-wolfeye/40 text-wolfeye rounded-full px-3 py-1 text-xs">${escapeHtml(n)}</span>`).join('');
+    } else {
+      wolfBox.classList.add('hidden');
+    }
+    show('screen-reveal');
+  });
+
+  // ---------------------------------------------------------------------
+  // Night phase
+  // ---------------------------------------------------------------------
+  socket.on('nightState', (data) => {
+    show('screen-night');
+    document.getElementById('night-number').textContent = lastRoomState ? lastRoomState.nightNumber : '1';
+    if (lastRoomState) {
+      document.getElementById('night-alive-count').textContent = lastRoomState.players.filter(p=>p.alive).length;
+    }
+    const panel = document.getElementById('night-panel');
+    const subtitle = document.getElementById('night-subtitle');
+
+    if (!data.alive) {
+      subtitle.textContent = 'You are eliminated — watching in spirit.';
+      panel.innerHTML = `<p class="text-center text-mist2 text-sm py-10">You cannot act, but the night continues around you.</p>`;
+      return;
+    }
+
+    if (data.action === 'wait') {
+      const stepLabel = { cupid: "Cupid is choosing lovers...", wolves: "The werewolves are hunting...", seer: "The Seer is peering into the dark...", witch: "The Witch weighs her potions..." }[data.step] || 'Waiting...';
+      subtitle.textContent = stepLabel;
+      panel.innerHTML = `
+        <div class="flex flex-col items-center justify-center py-10 text-center">
+          <div class="w-3 h-3 rounded-full bg-moon pulse-ring mb-4"></div>
+          <p class="text-mist text-sm">Close your eyes. It is not your turn to act.</p>
+        </div>`;
+      return;
+    }
+
+    if (data.action === 'cupid') {
+      subtitle.textContent = 'Choose two players to fall in love.';
+      panel.innerHTML = `<p class="text-xs text-mist2 mb-3">Select exactly two players.</p><div id="cupid-list" class="grid grid-cols-2 gap-2 mb-4"></div><button id="cupid-confirm" disabled class="w-full bg-blood disabled:opacity-40 text-white py-2 rounded-lg font-semibold text-sm">Confirm Lovers</button>`;
+      const listEl = document.getElementById('cupid-list');
+      const chosen = new Set();
+      data.options.forEach((o) => {
+        const chip = document.createElement('button');
+        chip.className = 'player-chip selectable bg-panel2 border border-hairline rounded-lg px-3 py-2 text-sm text-left';
+        chip.textContent = o.name;
+        chip.addEventListener('click', () => {
+          if (chosen.has(o.id)) { chosen.delete(o.id); chip.classList.remove('selected'); }
+          else if (chosen.size < 2) { chosen.add(o.id); chip.classList.add('selected'); }
+          document.getElementById('cupid-confirm').disabled = chosen.size !== 2;
+        });
+        listEl.appendChild(chip);
+      });
+      document.getElementById('cupid-confirm').addEventListener('click', () => {
+        socket.emit('cupidChoose', { code: roomCode, targets: [...chosen] });
+        panel.innerHTML = `<p class="text-center text-mist2 text-sm py-10">Lovers chosen. Waiting for the night to continue...</p>`;
+      });
+      return;
+    }
+
+    if (data.action === 'wolves') {
+      subtitle.textContent = 'Choose your victim together.';
+      panel.innerHTML = `
+        <p class="text-xs uppercase tracking-widest text-wolfeye mb-2">Your pack: ${data.wolfTeam.map(escapeHtml).join(', ')}</p>
+        <div id="wolf-list" class="grid grid-cols-2 gap-2 mb-3"></div>
+        <p id="wolf-tally" class="text-xs text-mist2"></p>`;
+      const listEl = document.getElementById('wolf-list');
+      data.options.forEach((o) => {
+        const chip = document.createElement('button');
+        chip.className = 'player-chip selectable bg-panel2 border border-hairline rounded-lg px-3 py-2 text-sm text-left';
+        chip.textContent = o.name;
+        chip.addEventListener('click', () => {
+          [...listEl.children].forEach((c) => c.classList.remove('selected'));
+          chip.classList.add('selected');
+          socket.emit('wolfVote', { code: roomCode, targetId: o.id });
+        });
+        listEl.appendChild(chip);
+      });
+      renderWolfTally(data.wolfVotes, data.options);
+      return;
+    }
+
+    if (data.action === 'seer') {
+      subtitle.textContent = 'Choose someone to inspect.';
+      if (data.lastResult) {
+        panel.innerHTML = `<div class="text-center py-8"><p class="text-mist2 text-sm mb-2">${escapeHtml(data.lastResult.name)} is a...</p><p class="font-display text-2xl ${data.lastResult.result === 'werewolf' ? 'text-wolfeye' : 'text-seer'}">${data.lastResult.result === 'werewolf' ? 'Werewolf 🐺' : 'Villager 🕊'}</p><p class="text-mist2 text-xs mt-4">Waiting for the night to continue...</p></div>`;
+        return;
+      }
+      panel.innerHTML = `<div id="seer-list" class="grid grid-cols-2 gap-2"></div>`;
+      const listEl = document.getElementById('seer-list');
+      data.options.forEach((o) => {
+        const chip = document.createElement('button');
+        chip.className = 'player-chip selectable bg-panel2 border border-hairline rounded-lg px-3 py-2 text-sm text-left';
+        chip.textContent = o.name;
+        chip.addEventListener('click', () => {
+          socket.emit('seerInspect', { code: roomCode, targetId: o.id });
+        });
+        listEl.appendChild(chip);
+      });
+      return;
+    }
+
+    if (data.action === 'witch') {
+      subtitle.textContent = 'Save a life, or take one.';
+      const wolfTargetLine = data.wolfTargetName
+        ? `The werewolves are attacking <span class="text-wolfeye">${escapeHtml(data.wolfTargetName)}</span> tonight.`
+        : `The werewolves chose no victim tonight.`;
+      panel.innerHTML = `
+        <p class="text-sm text-mist mb-4">${wolfTargetLine}</p>
+        <div class="flex gap-2 mb-4">
+          <button id="witch-heal" class="flex-1 bg-panel2 border border-hairline rounded-lg py-2 text-sm ${!data.canHeal || !data.wolfTargetName ? 'opacity-40 cursor-not-allowed' : 'hover:border-witch'}" ${(!data.canHeal || !data.wolfTargetName) ? 'disabled' : ''}>🧪 Heal</button>
+          <button id="witch-skip-heal" class="flex-1 bg-panel2 border border-hairline rounded-lg py-2 text-sm hover:border-hairline">Don't heal</button>
+        </div>
+        <div id="witch-poison-section" class="${data.canPoison ? '' : 'hidden'}">
+          <p class="text-xs text-mist2 mb-2">Optionally poison someone:</p>
+          <div id="witch-poison-list" class="grid grid-cols-2 gap-2 mb-3"></div>
+        </div>
+        <button id="witch-confirm" class="w-full bg-blood hover:bg-blood2 text-white py-2 rounded-lg font-semibold text-sm">Confirm & End Turn</button>
+      `;
+      let willHeal = false;
+      let poisonTarget = null;
+      if (data.canHeal && data.wolfTargetName) {
+        document.getElementById('witch-heal').addEventListener('click', () => {
+          willHeal = true;
+          document.getElementById('witch-heal').classList.add('selected','border-witch');
+          document.getElementById('witch-skip-heal').classList.remove('selected','border-witch');
+        });
+      }
+      document.getElementById('witch-skip-heal').addEventListener('click', () => {
+        willHeal = false;
+        document.getElementById('witch-skip-heal').classList.add('selected','border-witch');
+        document.getElementById('witch-heal').classList.remove('selected','border-witch');
+      });
+      if (data.canPoison) {
+        const listEl = document.getElementById('witch-poison-list');
+        data.poisonOptions.forEach((o) => {
+          const chip = document.createElement('button');
+          chip.className = 'player-chip selectable bg-panel2 border border-hairline rounded-lg px-3 py-2 text-sm text-left';
+          chip.textContent = o.name;
+          chip.addEventListener('click', () => {
+            [...listEl.children].forEach((c) => c.classList.remove('selected'));
+            if (poisonTarget === o.id) { poisonTarget = null; }
+            else { poisonTarget = o.id; chip.classList.add('selected'); }
+          });
+          listEl.appendChild(chip);
+        });
+      }
+      document.getElementById('witch-confirm').addEventListener('click', () => {
+        socket.emit('witchAction', { code: roomCode, heal: willHeal, poisonTargetId: poisonTarget });
+        panel.innerHTML = `<p class="text-center text-mist2 text-sm py-10">Your potions are cast. Waiting for dawn...</p>`;
+      });
+      return;
+    }
+  });
+
+  socket.on('wolfVoteUpdate', (data) => {
+    const options = [...document.querySelectorAll('#wolf-list .player-chip')].map((el, i) => null);
+    // just re-render tally text using current DOM options list order isn't reliable; refetch names via panel data attr fallback
+    renderWolfTallyRaw(data.wolfVotes);
+  });
+
+  function renderWolfTally(wolfVotes, options) {
+    renderWolfTallyRaw(wolfVotes);
+  }
+  function renderWolfTallyRaw(wolfVotes) {
+    const el = document.getElementById('wolf-tally');
+    if (!el) return;
+    const n = Object.keys(wolfVotes || {}).length;
+    el.textContent = n ? `${n} wolf vote(s) submitted...` : '';
+  }
+
+  socket.on('seerResult', () => { /* handled inline via lastResult on next nightState emit already shown by server resend not needed */ });
+
+  socket.on('loversRevealed', (data) => {
+    const panel = document.getElementById('night-panel');
+    if (panel) {
+      const note = document.createElement('p');
+      note.className = 'text-moon text-xs mt-3 text-center';
+      note.textContent = `💘 You are now in love with ${data.partnerName}. If one of you dies, the other will too.`;
+      panel.appendChild(note);
+    }
+  });
+
+  // ---------------------------------------------------------------------
+  // Day announcement
+  // ---------------------------------------------------------------------
+  socket.on('dayAnnouncement', (data) => {
+    show('screen-announce');
+    const panel = document.getElementById('announce-panel');
+    if (!data.deaths.length) {
+      panel.innerHTML = `<p class="text-2xl font-display text-seer mb-2">Everyone survived the night.</p><p class="text-mist2 text-sm">No one was attacked. Rejoice — cautiously.</p>`;
+    } else {
+      panel.innerHTML = `
+        <p class="text-mist2 text-sm mb-3">This morning, the village found:</p>
+        ${data.deaths.map((d) => `<p class="text-xl font-display text-blood mb-1">💀 ${escapeHtml(d.name)}</p><p class="text-xs text-mist2 mb-3">was the <span class="${ROLE_COLORS[d.role]}">${ROLE_LABELS[d.role]}</span></p>`).join('')}
+      `;
+    }
+  });
+
+  socket.on('phaseNote', (data) => {
+    // lightweight toast-like note appended to announce/discuss panel if visible
+    console.log(data.message);
+  });
+
+  // ---------------------------------------------------------------------
+  // Hunter
+  // ---------------------------------------------------------------------
+  socket.on('hunterPrompt', (data) => {
+    show('screen-hunter');
+    document.getElementById('hunter-message').textContent = 'You have died. Choose one player to take with you.';
+    const box = document.getElementById('hunter-options');
+    box.innerHTML = '';
+    data.options.forEach((o) => {
+      const btn = document.createElement('button');
+      btn.className = 'w-full text-left bg-panel2 border border-hairline hover:border-blood rounded-lg px-4 py-3 text-sm';
+      btn.textContent = o.name;
+      btn.addEventListener('click', () => {
+        socket.emit('hunterShoot', { code: roomCode, targetId: o.id });
+        box.innerHTML = `<p class="text-center text-mist2 text-sm py-6">Shot fired...</p>`;
+      });
+      box.appendChild(btn);
+    });
+  });
+
+  socket.on('hunterResult', (data) => {
+    // Everyone (except the acting hunter, who already sees their own screen) gets informed via next phase renders.
+    console.log(`${data.hunter} shot ${data.target} (${data.role})`);
+  });
+
+  // ---------------------------------------------------------------------
+  // Discussion
+  // ---------------------------------------------------------------------
+  function renderDiscussPlayers(state) {
+    const list = document.getElementById('discuss-players');
+    if (!list) return;
+    list.innerHTML = '';
+    state.players.forEach((p) => {
+      const li = document.createElement('li');
+      li.className = `flex items-center gap-2 bg-panel2 border border-hairline rounded-lg px-3 py-2 text-sm ${p.alive ? '' : 'opacity-40 line-through'}`;
+      li.textContent = `${p.alive ? '🟢' : '💀'} ${p.isHost ? '👑 ' : ''}${p.name}`;
+      list.appendChild(li);
+    });
+  }
+
+  socket.on('discussionStarted', (data) => {
+    show('screen-discuss');
+    document.getElementById('btn-skip-discuss').classList.toggle('hidden', !isHost);
+    if (discussionInterval) clearInterval(discussionInterval);
+    const timerEl = document.getElementById('discuss-timer');
+    if (!data.endsAt) {
+      timerEl.textContent = 'No timer';
+      return;
+    }
+    function tick() {
+      const remaining = Math.max(0, Math.round((data.endsAt - Date.now()) / 1000));
+      const m = String(Math.floor(remaining / 60)).padStart(2, '0');
+      const s = String(remaining % 60).padStart(2, '0');
+      timerEl.textContent = `${m}:${s}`;
+      if (remaining <= 0) clearInterval(discussionInterval);
+    }
+    tick();
+    discussionInterval = setInterval(tick, 500);
+  });
+
+  document.getElementById('btn-skip-discuss').addEventListener('click', () => {
+    socket.emit('hostSkipTimer', { code: roomCode });
+  });
+
+  // ---------------------------------------------------------------------
+  // Voting
+  // ---------------------------------------------------------------------
+  socket.on('voteStarted', (data) => {
+    show('screen-vote');
+    const amAlive = lastRoomState ? lastRoomState.players.find((p) => p.id === myId)?.alive : true;
+    document.getElementById('vote-options').classList.toggle('hidden', !amAlive);
+    document.getElementById('vote-spectator').classList.toggle('hidden', amAlive);
+    document.getElementById('vote-status').textContent = 'Choose who to eliminate.';
+    const box = document.getElementById('vote-options');
+    box.innerHTML = '';
+    data.options.forEach((o) => {
+      const btn = document.createElement('button');
+      btn.className = 'w-full flex items-center justify-between bg-panel2 border border-hairline hover:border-moon rounded-lg px-4 py-3 text-sm';
+      btn.innerHTML = `<span>${escapeHtml(o.name)}</span><span class="vote-count text-xs text-mist2" data-id="${o.id}">0</span>`;
+      btn.addEventListener('click', () => {
+        [...box.children].forEach((c) => c.classList.remove('selected'));
+        btn.classList.add('selected');
+        socket.emit('dayVote', { code: roomCode, targetId: o.id });
+      });
+      box.appendChild(btn);
+    });
+  });
+
+  socket.on('voteTally', (data) => {
+    document.querySelectorAll('.vote-count').forEach((el) => {
+      const id = el.dataset.id;
+      el.textContent = data.counts[id] || 0;
+    });
+    document.getElementById('vote-status').textContent = `${data.votesIn} / ${data.totalAlive} votes cast`;
+  });
+
+  socket.on('voteResult', (data) => {
+    show('screen-result');
+    const panel = document.getElementById('result-panel');
+    if (data.tie || !data.eliminated.length) {
+      panel.innerHTML = `<p class="text-xl font-display text-seer mb-2">The vote was inconclusive.</p><p class="text-mist2 text-sm">No one is eliminated today.</p>`;
+    } else {
+      panel.innerHTML = data.eliminated.map((d) => `
+        <p class="text-2xl font-display text-blood mb-1">⚖️ ${escapeHtml(d.name)}</p>
+        <p class="text-xs text-mist2 mb-3">was voted out — they were the <span class="${ROLE_COLORS[d.role]}">${ROLE_LABELS[d.role]}</span></p>
+      `).join('');
+    }
+  });
+
+  // ---------------------------------------------------------------------
+  // Game over
+  // ---------------------------------------------------------------------
+  socket.on('gameOver', (data) => {
+    show('screen-gameover');
+    const title = document.getElementById('gameover-title');
+    if (data.winner === 'villagers') {
+      title.textContent = 'The Village Wins';
+      title.className = 'font-display text-4xl mb-2 text-seer';
+    } else {
+      title.textContent = 'The Werewolves Win';
+      title.className = 'font-display text-4xl mb-2 text-wolfeye';
+    }
+    const list = document.getElementById('gameover-roles');
+    list.innerHTML = data.players.map((p) => `
+      <li class="flex items-center justify-between bg-panel2 border border-hairline rounded-lg px-3 py-2 text-sm ${p.alive ? '' : 'opacity-60'}">
+        <span>${p.alive ? '🟢' : '💀'} ${escapeHtml(p.name)}</span>
+        <span class="${ROLE_COLORS[p.role]} text-xs">${ROLE_LABELS[p.role]}</span>
+      </li>
+    `).join('');
+    document.getElementById('btn-play-again').classList.toggle('hidden', !isHost);
+    document.getElementById('gameover-wait').classList.toggle('hidden', isHost);
+  });
+
+  document.getElementById('btn-play-again').addEventListener('click', () => {
+    socket.emit('playAgain', { code: roomCode });
+  });
+
+  socket.on('connect', () => { myId = socket.id; });
+
+})();
+</script>
+</body>
+</html>
