@@ -10,6 +10,16 @@
  * for a free single-instance deploy (Render/Replit/Glitch). If you need it to
  * survive restarts or scale to multiple server instances, swap the `rooms`
  * object for Redis/Firebase — the socket event contracts stay the same.
+ *
+ * ROLES: werewolf, villager, seer, witch, hunter, cupid, minion, mason,
+ * robber, troublemaker, drunk, insomniac, tanner, medic.
+ *
+ * Robber / Troublemaker / Drunk / Insomniac are adapted from One Night
+ * Werewolf, where they normally only exist in a single-night game. Here they
+ * act ONLY on night 1 (role-swaps), since roles are otherwise persistent
+ * across a multi-night game. Drunk swaps blindly with a hidden "center card"
+ * (not a real player) so no other player's role is silently changed without
+ * at least being the result of an explicit swap action.
  */
 
 const express = require('express');
@@ -38,6 +48,14 @@ const DEFAULT_SETTINGS = {
   witch: true,
   hunter: true,
   cupid: false,
+  minion: false,
+  masons: false, // adds a PAIR of masons
+  robber: false,
+  troublemaker: false,
+  drunk: false,
+  insomniac: false,
+  tanner: false,
+  medic: false,
   discussionSeconds: 90, // 0 = disabled
 };
 
@@ -60,13 +78,16 @@ function makeRoom(code, hostSocketId) {
   return {
     code,
     hostId: hostSocketId,
-    players: [], // {id, name, alive, role, isHost, votedOutHistory...}
+    players: [], // {id, name, alive, role, isHost, ...}
     settings: { ...DEFAULT_SETTINGS },
     phase: 'lobby', // lobby -> reveal -> night -> day-announce -> day-discuss -> day-vote -> day-result -> gameover
     nightNumber: 0,
     night: freshNight(),
     dayVotes: {}, // voterId -> targetId
     lovers: [], // [id, id]
+    centerCards: [], // hidden roles not assigned to any player (used by Drunk)
+    lastMedicTarget: null, // enforce "can't protect the same person twice in a row"
+    witchPotions: { healUsed: false, poisonUsed: false }, // persists for the WHOLE game
     log: [],
     timer: null, // active setTimeout handle
     timerEndsAt: null,
@@ -81,12 +102,13 @@ function freshNight() {
     wolfTarget: null,
     seerTarget: null,
     seerResult: null,
-    witchHealUsed: false,
-    witchPoisonUsed: false,
-    witchHeal: false,
-    witchPoisonTarget: null,
+    witchHeal: false, // this night's choice only
+    witchPoisonTarget: null, // this night's choice only
+    medicTarget: null,
     cupidDone: false,
-    step: 'cupid', // cupid -> wolves -> seer -> witch -> resolve
+    stepOrder: [],
+    stepIndex: 0,
+    step: 'resolve',
   };
 }
 
@@ -135,6 +157,10 @@ function findPlayer(room, id) {
   return room.players.find((p) => p.id === id);
 }
 
+function alivePlayerWithRole(room, role) {
+  return room.players.find((p) => p.role === role && p.alive);
+}
+
 function clearTimer(room) {
   if (room.timer) {
     clearTimeout(room.timer);
@@ -165,12 +191,20 @@ function assignRoles(room) {
   const s = room.settings;
   const roles = [];
 
-  const wolfCount = Math.max(1, Math.min(s.werewolves, Math.floor(n / 2) - (s.witch || s.seer ? 0 : -1) || 1));
+  const wolfCount = Math.max(1, Math.min(s.werewolves, Math.floor(n / 2) || 1));
   for (let i = 0; i < wolfCount; i++) roles.push('werewolf');
   if (s.seer) roles.push('seer');
   if (s.witch) roles.push('witch');
   if (s.hunter) roles.push('hunter');
   if (s.cupid) roles.push('cupid');
+  if (s.minion) roles.push('minion');
+  if (s.masons) roles.push('mason', 'mason');
+  if (s.robber) roles.push('robber');
+  if (s.troublemaker) roles.push('troublemaker');
+  if (s.drunk) roles.push('drunk');
+  if (s.insomniac) roles.push('insomniac');
+  if (s.tanner) roles.push('tanner');
+  if (s.medic) roles.push('medic');
   while (roles.length < n) roles.push('villager');
 
   const shuffled = shuffle(roles).slice(0, n);
@@ -182,6 +216,13 @@ function assignRoles(room) {
     p.diedPhase = null;
     p.hunterFired = false;
   });
+
+  // Center cards: only relevant if Drunk is in play. A fixed, simple pair
+  // (one villager, one werewolf) gives Drunk real tension without needing
+  // to touch a real player's role.
+  room.centerCards = s.drunk ? shuffle(['villager', 'werewolf']) : [];
+  room.lastMedicTarget = null;
+  room.witchPotions = { healUsed: false, poisonUsed: false };
 }
 
 const ROLE_INFO = {
@@ -203,7 +244,7 @@ const ROLE_INFO = {
   witch: {
     team: 'villagers',
     label: 'Witch',
-    instructions: 'You have one healing potion and one poison potion for the whole game. Each night you see the werewolves\u2019 victim and may save them, and/or poison someone else.',
+    instructions: 'You have one healing potion and one poison potion for the whole game (not per night). Each night you see the werewolves\u2019 victim and may save them, and/or poison someone else.',
   },
   hunter: {
     team: 'villagers',
@@ -215,6 +256,46 @@ const ROLE_INFO = {
     label: 'Cupid',
     instructions: 'On the first night, choose two players to fall in love. If one lover dies, the other dies of heartbreak.',
   },
+  minion: {
+    team: 'werewolves',
+    label: 'Minion',
+    instructions: 'You are on the werewolves\u2019 team and you know who they are — but they don\u2019t know you. You can\u2019t be killed at night by the wolves. Mislead the village to protect your team.',
+  },
+  mason: {
+    team: 'villagers',
+    label: 'Mason',
+    instructions: 'You know your fellow Mason(s). You have no night action beyond knowing each other — use that trust to help the village during the day.',
+  },
+  robber: {
+    team: 'villagers',
+    label: 'Robber',
+    instructions: 'On the first night only, you may swap roles with another player and secretly look at your new role. You become whatever you stole.',
+  },
+  troublemaker: {
+    team: 'villagers',
+    label: 'Troublemaker',
+    instructions: 'On the first night only, you may swap the roles of two OTHER players, without seeing what either of them becomes.',
+  },
+  drunk: {
+    team: 'villagers',
+    label: 'Drunk',
+    instructions: 'On the first night only, you swap your role with a hidden card, without knowing what you become. Play cautiously — you might not be who you think you are.',
+  },
+  insomniac: {
+    team: 'villagers',
+    label: 'Insomniac',
+    instructions: 'On the first night, after the shuffling is done, you wake up and check your OWN current role, in case it changed.',
+  },
+  tanner: {
+    team: 'independent',
+    label: 'Tanner',
+    instructions: 'You want to die! You win alone if the village votes to eliminate you during the day (not if you die at night).',
+  },
+  medic: {
+    team: 'villagers',
+    label: 'Medic',
+    instructions: 'Each night, choose one player to protect from the werewolves. You cannot protect the same person on two nights in a row.',
+  },
 };
 
 function roleReveal(room) {
@@ -224,14 +305,45 @@ function roleReveal(room) {
       p.role === 'werewolf'
         ? room.players.filter((o) => o.role === 'werewolf' && o.id !== p.id).map((o) => o.name)
         : undefined;
+    const werewolfNames =
+      p.role === 'minion'
+        ? room.players.filter((o) => o.role === 'werewolf').map((o) => o.name)
+        : undefined;
+    const masonTeammates =
+      p.role === 'mason'
+        ? room.players.filter((o) => o.role === 'mason' && o.id !== p.id).map((o) => o.name)
+        : undefined;
     io.to(p.id).emit('roleAssigned', {
       role: p.role,
       team: info.team,
       label: info.label,
       instructions: info.instructions,
       wolfTeammates,
+      werewolfNames,
+      masonTeammates,
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Night step engine
+// ---------------------------------------------------------------------------
+
+function computeNightSteps(room) {
+  const isNight1 = room.nightNumber === 1;
+  const has = (role) => alivePlayerWithRole(room, role);
+  const steps = [];
+  if (isNight1 && has('cupid')) steps.push('cupid');
+  if (isNight1 && has('robber')) steps.push('robber');
+  if (isNight1 && has('troublemaker')) steps.push('troublemaker');
+  if (isNight1 && has('drunk')) steps.push('drunk');
+  if (isNight1 && has('insomniac')) steps.push('insomniac');
+  steps.push('wolves');
+  if (has('seer')) steps.push('seer');
+  if (has('medic')) steps.push('medic');
+  if (has('witch')) steps.push('witch');
+  steps.push('resolve');
+  return steps;
 }
 
 // ---------------------------------------------------------------------------
@@ -257,12 +369,9 @@ function beginNight(room) {
   room.nightNumber += 1;
   room.night = freshNight();
   room.phase = 'night';
-
-  // skip cupid step unless it's night 1 and cupid role is in play and alive
-  const cupid = room.players.find((p) => p.role === 'cupid');
-  if (!(room.nightNumber === 1 && cupid && cupid.alive)) {
-    room.night.step = 'wolves';
-  }
+  room.night.stepOrder = computeNightSteps(room);
+  room.night.stepIndex = 0;
+  room.night.step = room.night.stepOrder[0];
 
   broadcastRoom(room);
   emitNightState(room);
@@ -280,6 +389,17 @@ function emitNightState(room) {
     if (n.step === 'cupid' && p.role === 'cupid') {
       payload.action = 'cupid';
       payload.options = room.players.filter((o) => o.alive).map((o) => ({ id: o.id, name: o.name }));
+    } else if (n.step === 'robber' && p.role === 'robber') {
+      payload.action = 'robber';
+      payload.options = alivePlayers(room).filter((o) => o.id !== p.id).map((o) => ({ id: o.id, name: o.name }));
+    } else if (n.step === 'troublemaker' && p.role === 'troublemaker') {
+      payload.action = 'troublemaker';
+      payload.options = alivePlayers(room).filter((o) => o.id !== p.id).map((o) => ({ id: o.id, name: o.name }));
+    } else if (n.step === 'drunk' && p.role === 'drunk') {
+      payload.action = 'drunk';
+    } else if (n.step === 'insomniac' && p.role === 'insomniac') {
+      payload.action = 'insomniac';
+      payload.currentRole = ROLE_INFO[p.role].label;
     } else if (n.step === 'wolves' && p.role === 'werewolf') {
       payload.action = 'wolves';
       payload.options = alivePlayers(room)
@@ -291,11 +411,16 @@ function emitNightState(room) {
       payload.action = 'seer';
       payload.options = alivePlayers(room).filter((o) => o.id !== p.id).map((o) => ({ id: o.id, name: o.name }));
       payload.lastResult = n.seerResult;
+    } else if (n.step === 'medic' && p.role === 'medic') {
+      payload.action = 'medic';
+      payload.options = alivePlayers(room)
+        .filter((o) => o.id !== room.lastMedicTarget)
+        .map((o) => ({ id: o.id, name: o.name }));
     } else if (n.step === 'witch' && p.role === 'witch') {
       payload.action = 'witch';
       payload.wolfTargetName = n.wolfTarget ? findPlayer(room, n.wolfTarget)?.name : null;
-      payload.canHeal = !n.witchHealUsed;
-      payload.canPoison = !n.witchPoisonUsed;
+      payload.canHeal = !room.witchPotions.healUsed;
+      payload.canPoison = !room.witchPotions.poisonUsed;
       payload.poisonOptions = alivePlayers(room)
         .filter((o) => o.id !== p.id)
         .map((o) => ({ id: o.id, name: o.name }));
@@ -308,15 +433,9 @@ function emitNightState(room) {
 
 function advanceNightStep(room) {
   const n = room.night;
-  if (n.step === 'cupid') n.step = 'wolves';
-  else if (n.step === 'wolves') n.step = room.players.some((p) => p.role === 'seer' && p.alive) ? 'seer' : 'witch';
-  else if (n.step === 'seer') n.step = 'witch';
-  else if (n.step === 'witch') {
-    resolveNight(room);
-    return;
-  }
-  // if witch role doesn't exist/alive, skip straight to resolve
-  if (n.step === 'witch' && !room.players.some((p) => p.role === 'witch' && p.alive)) {
+  n.stepIndex += 1;
+  n.step = n.stepOrder[n.stepIndex] || 'resolve';
+  if (n.step === 'resolve') {
     resolveNight(room);
     return;
   }
@@ -327,12 +446,15 @@ function resolveNight(room) {
   const n = room.night;
   const deaths = new Set();
 
-  if (n.wolfTarget && !(n.witchHeal)) {
-    deaths.add(n.wolfTarget);
-  }
-  if (n.witchPoisonTarget) {
-    deaths.add(n.witchPoisonTarget);
-  }
+  const wolfKilled = n.wolfTarget && !n.witchHeal && n.wolfTarget !== n.medicTarget;
+  if (wolfKilled) deaths.add(n.wolfTarget);
+  if (n.witchPoisonTarget) deaths.add(n.witchPoisonTarget);
+
+  // Minions are on the werewolves' team and can't be killed by their own pack.
+  [...deaths].forEach((id) => {
+    const p = findPlayer(room, id);
+    if (p && p.role === 'minion' && id === n.wolfTarget) deaths.delete(id);
+  });
 
   // lovers heartbreak chain
   applyLoverDeaths(room, deaths);
@@ -450,6 +572,30 @@ function resolveVotes(room) {
   room.phase = 'day-result';
   const eliminated = eliminatedId ? findPlayer(room, eliminatedId) : null;
 
+  // Tanner: wins alone, immediately, if lynched by day vote (not via hunter
+  // chain or lover heartbreak, and never from a night death).
+  if (eliminated && eliminated.role === 'tanner') {
+    eliminated.alive = false;
+    eliminated.diedAt = room.nightNumber;
+    eliminated.diedPhase = 'day';
+    log(room, `Day ${room.nightNumber}: the village lynched ${eliminated.name} — the Tanner!`);
+    broadcastRoom(room);
+    io.to(room.code).emit('voteResult', {
+      counts,
+      tie: false,
+      eliminated: [{ id: eliminated.id, name: eliminated.name, role: eliminated.role }],
+    });
+    room.phase = 'gameover';
+    clearTimer(room);
+    io.to(room.code).emit('gameOver', {
+      winner: 'tanner',
+      winnerName: eliminated.name,
+      players: room.players.map((p) => ({ id: p.id, name: p.name, role: p.role, alive: p.alive })),
+    });
+    broadcastRoom(room);
+    return;
+  }
+
   const deaths = new Set();
   if (eliminated) deaths.add(eliminated.id);
   applyLoverDeaths(room, deaths);
@@ -545,6 +691,14 @@ io.on('connection', (socket) => {
       witch: !!settings.witch,
       hunter: !!settings.hunter,
       cupid: !!settings.cupid,
+      minion: !!settings.minion,
+      masons: !!settings.masons,
+      robber: !!settings.robber,
+      troublemaker: !!settings.troublemaker,
+      drunk: !!settings.drunk,
+      insomniac: !!settings.insomniac,
+      tanner: !!settings.tanner,
+      medic: !!settings.medic,
       discussionSeconds: [0, 60, 90, 120, 180].includes(parseInt(settings.discussionSeconds))
         ? parseInt(settings.discussionSeconds)
         : 90,
@@ -571,6 +725,56 @@ io.on('connection', (socket) => {
     room.night.cupidDone = true;
     io.to(targets[0]).emit('loversRevealed', { partnerId: targets[1], partnerName: findPlayer(room, targets[1])?.name });
     io.to(targets[1]).emit('loversRevealed', { partnerId: targets[0], partnerName: findPlayer(room, targets[0])?.name });
+    advanceNightStep(room);
+  });
+
+  socket.on('robberSwap', ({ code, targetId }) => {
+    const room = getRoom(code);
+    if (!room || room.phase !== 'night' || room.night.step !== 'robber') return;
+    const me = findPlayer(room, socket.id);
+    const target = findPlayer(room, targetId);
+    if (!me || me.role !== 'robber' || !me.alive || !target || target.id === me.id || !target.alive) return;
+    const temp = me.role;
+    me.role = target.role;
+    target.role = temp;
+    const info = ROLE_INFO[me.role];
+    io.to(me.id).emit('roleUpdated', { role: me.role, label: info.label, team: info.team, instructions: info.instructions });
+    advanceNightStep(room);
+  });
+
+  socket.on('troublemakerSwap', ({ code, targetAId, targetBId }) => {
+    const room = getRoom(code);
+    if (!room || room.phase !== 'night' || room.night.step !== 'troublemaker') return;
+    const me = findPlayer(room, socket.id);
+    const a = findPlayer(room, targetAId);
+    const b = findPlayer(room, targetBId);
+    if (!me || me.role !== 'troublemaker' || !me.alive) return;
+    if (!a || !b || a.id === b.id || a.id === me.id || b.id === me.id || !a.alive || !b.alive) return;
+    const temp = a.role;
+    a.role = b.role;
+    b.role = temp;
+    advanceNightStep(room);
+  });
+
+  socket.on('drunkSwap', ({ code }) => {
+    const room = getRoom(code);
+    if (!room || room.phase !== 'night' || room.night.step !== 'drunk') return;
+    const me = findPlayer(room, socket.id);
+    if (!me || me.role !== 'drunk' || !me.alive) return;
+    if (room.centerCards.length > 0) {
+      const idx = Math.floor(Math.random() * room.centerCards.length);
+      const newRole = room.centerCards[idx];
+      room.centerCards[idx] = me.role;
+      me.role = newRole;
+    }
+    advanceNightStep(room);
+  });
+
+  socket.on('insomniacDone', ({ code }) => {
+    const room = getRoom(code);
+    if (!room || room.phase !== 'night' || room.night.step !== 'insomniac') return;
+    const me = findPlayer(room, socket.id);
+    if (!me || me.role !== 'insomniac' || !me.alive) return;
     advanceNightStep(room);
   });
 
@@ -612,18 +816,30 @@ io.on('connection', (socket) => {
     advanceNightStep(room);
   });
 
+  socket.on('medicProtect', ({ code, targetId }) => {
+    const room = getRoom(code);
+    if (!room || room.phase !== 'night' || room.night.step !== 'medic') return;
+    const me = findPlayer(room, socket.id);
+    const target = findPlayer(room, targetId);
+    if (!me || me.role !== 'medic' || !me.alive || !target || !target.alive) return;
+    if (targetId === room.lastMedicTarget) return; // can't repeat
+    room.night.medicTarget = targetId;
+    room.lastMedicTarget = targetId;
+    advanceNightStep(room);
+  });
+
   socket.on('witchAction', ({ code, heal, poisonTargetId }) => {
     const room = getRoom(code);
     if (!room || room.phase !== 'night' || room.night.step !== 'witch') return;
     const me = findPlayer(room, socket.id);
     if (!me || me.role !== 'witch' || !me.alive) return;
-    if (heal && !room.night.witchHealUsed) {
+    if (heal && !room.witchPotions.healUsed) {
       room.night.witchHeal = true;
-      room.night.witchHealUsed = true;
+      room.witchPotions.healUsed = true;
     }
-    if (poisonTargetId && !room.night.witchPoisonUsed) {
+    if (poisonTargetId && !room.witchPotions.poisonUsed) {
       room.night.witchPoisonTarget = poisonTargetId;
-      room.night.witchPoisonUsed = true;
+      room.witchPotions.poisonUsed = true;
     }
     advanceNightStep(room);
   });
@@ -683,6 +899,9 @@ io.on('connection', (socket) => {
     room.nightNumber = 0;
     room.lovers = [];
     room.dayVotes = {};
+    room.centerCards = [];
+    room.lastMedicTarget = null;
+    room.witchPotions = { healUsed: false, poisonUsed: false };
     room.night = freshNight();
     room.players.forEach((p) => {
       p.alive = true;
