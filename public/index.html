@@ -272,7 +272,8 @@
           <p class="text-xs uppercase tracking-widest text-wolfeye mb-2">Your fellow werewolves</p>
           <div id="reveal-wolfteam-list" class="flex flex-wrap justify-center gap-2"></div>
         </div>
-        <p class="text-mist2 text-xs mt-6">Night falls shortly...</p>
+        <button id="btn-role-ready" class="mt-7 w-full bg-blood hover:bg-blood2 transition text-white font-semibold py-3 rounded-lg font-display tracking-wide">I've Read My Role — Ready</button>
+        <p id="reveal-ready-status" class="text-mist2 text-xs mt-3"></p>
       </div>
     </section>
 
@@ -371,9 +372,24 @@
   const socket = io();
 
   // ---------------------------------------------------------------------
+  // Stable client identity — survives reloads and dropped connections.
+  // This (not socket.id, which changes on every reconnect) is what the
+  // server uses to recognize "this is still the same player."
+  // ---------------------------------------------------------------------
+  function getClientId() {
+    let id = localStorage.getItem('hollow_client_id');
+    if (!id) {
+      id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : `cid-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      localStorage.setItem('hollow_client_id', id);
+    }
+    return id;
+  }
+  const clientId = getClientId();
+
+  // ---------------------------------------------------------------------
   // State
   // ---------------------------------------------------------------------
-  let myId = null;
+  let myId = clientId; // stable across the whole session, unlike socket.id
   let roomCode = null;
   let isHost = false;
   let myRole = null;
@@ -429,9 +445,10 @@
     const errEl = document.getElementById('create-error');
     errEl.classList.add('hidden');
     if (!name) { errEl.textContent = 'Please enter your name.'; errEl.classList.remove('hidden'); return; }
-    socket.emit('createRoom', { name }, (res) => {
+    socket.emit('createRoom', { name, clientId }, (res) => {
       if (!res.success) { errEl.textContent = res.error || 'Could not create room.'; errEl.classList.remove('hidden'); return; }
-      roomCode = res.code; myId = socket.id; isHost = true;
+      roomCode = res.code; isHost = true;
+      localStorage.setItem('hollow_room_code', roomCode);
       setRoomBadge(roomCode);
       document.getElementById('lobby-code').textContent = roomCode;
       show('screen-lobby');
@@ -444,9 +461,10 @@
     const errEl = document.getElementById('join-error');
     errEl.classList.add('hidden');
     if (!code || !name) { errEl.textContent = 'Please enter both a room code and your name.'; errEl.classList.remove('hidden'); return; }
-    socket.emit('joinRoom', { code, name }, (res) => {
+    socket.emit('joinRoom', { code, name, clientId }, (res) => {
       if (!res.success) { errEl.textContent = res.error || 'Could not join room.'; errEl.classList.remove('hidden'); return; }
-      roomCode = res.code; myId = socket.id; isHost = (res.hostId === socket.id);
+      roomCode = res.code; isHost = (res.hostId === myId);
+      localStorage.setItem('hollow_room_code', roomCode);
       setRoomBadge(roomCode);
       document.getElementById('lobby-code').textContent = roomCode;
       show('screen-lobby');
@@ -542,7 +560,8 @@
     state.players.forEach((p) => {
       const li = document.createElement('li');
       li.className = 'player-chip flex items-center justify-between bg-panel2 border border-hairline rounded-lg px-3 py-2 text-sm';
-      li.innerHTML = `<span>${p.isHost ? '👑 ' : ''}${escapeHtml(p.name)}${p.id === myId ? ' <span class="text-mist2">(you)</span>' : ''}</span>`;
+      const reconnecting = p.connected === false ? ' <span class="text-moon2 text-xs">(reconnecting\u2026)</span>' : '';
+      li.innerHTML = `<span>${p.isHost ? '👑 ' : ''}${escapeHtml(p.name)}${p.id === myId ? ' <span class="text-mist2">(you)</span>' : ''}${reconnecting}</span>`;
       list.appendChild(li);
     });
     document.getElementById('lobby-count').textContent = `${state.players.length} / needs 4+`;
@@ -618,6 +637,22 @@
       wolfBox.classList.add('hidden');
     }
     show('screen-reveal');
+    const readyBtn = document.getElementById('btn-role-ready');
+    readyBtn.disabled = false;
+    readyBtn.textContent = "I've Read My Role — Ready";
+    document.getElementById('reveal-ready-status').textContent = '';
+  });
+
+  document.getElementById('btn-role-ready').addEventListener('click', () => {
+    const btn = document.getElementById('btn-role-ready');
+    btn.disabled = true;
+    btn.textContent = 'Waiting for everyone else\u2026';
+    socket.emit('roleReady', { code: roomCode });
+  });
+
+  socket.on('revealReadyUpdate', (data) => {
+    const statusEl = document.getElementById('reveal-ready-status');
+    if (statusEl) statusEl.textContent = `${data.ready} / ${data.total} players ready`;
   });
 
   socket.on('roleUpdated', (data) => {
@@ -962,7 +997,8 @@
     state.players.forEach((p) => {
       const li = document.createElement('li');
       li.className = `flex items-center gap-2 bg-panel2 border border-hairline rounded-lg px-3 py-2 text-sm ${p.alive ? '' : 'opacity-40 line-through'}`;
-      li.textContent = `${p.alive ? '🟢' : '💀'} ${p.isHost ? '👑 ' : ''}${p.name}`;
+      const reconnecting = p.connected === false ? ' (reconnecting\u2026)' : '';
+      li.textContent = `${p.alive ? '🟢' : '💀'} ${p.isHost ? '👑 ' : ''}${p.name}${reconnecting}`;
       list.appendChild(li);
     });
   }
@@ -1067,7 +1103,31 @@
     socket.emit('playAgain', { code: roomCode });
   });
 
-  socket.on('connect', () => { myId = socket.id; });
+  socket.on('connect', () => {
+    const storedCode = localStorage.getItem('hollow_room_code');
+    if (!storedCode) return; // fresh visit, nothing to resume
+    socket.emit('rejoinRoom', { code: storedCode, clientId }, (res) => {
+      if (!res || !res.success) {
+        // Room is gone or we're no longer part of it — start fresh.
+        localStorage.removeItem('hollow_room_code');
+        return;
+      }
+      roomCode = res.code;
+      isHost = res.hostId === myId;
+      setRoomBadge(roomCode);
+      document.getElementById('lobby-code').textContent = roomCode;
+      // Land on the lobby immediately; if the game is already underway,
+      // the server's catch-up events (roleAssigned/nightState/etc.) will
+      // fire right after this and move us to the correct screen.
+      if (res.phase === 'lobby') show('screen-lobby');
+    });
+  });
+
+  socket.on('disconnect', () => {
+    // The socket dropped — this is expected on flaky mobile connections.
+    // We don't clear localStorage here; `connect` will fire again and
+    // attempt to rejoin automatically once the connection is back.
+  });
 
 })();
 </script>
