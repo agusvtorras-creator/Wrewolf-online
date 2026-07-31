@@ -14,12 +14,16 @@
  * ROLES: werewolf, villager, seer, witch, hunter, cupid, minion, mason,
  * robber, troublemaker, drunk, insomniac, tanner, medic.
  *
- * Robber / Troublemaker / Drunk / Insomniac are adapted from One Night
- * Werewolf, where they normally only exist in a single-night game. Here they
- * act ONLY on night 1 (role-swaps), since roles are otherwise persistent
- * across a multi-night game. Drunk swaps blindly with a hidden "center card"
- * (not a real player) so no other player's role is silently changed without
- * at least being the result of an explicit swap action.
+ * IDENTITY & RECONNECTION
+ * ------------------------
+ * Every player has a stable `id` (a client-generated UUID persisted in the
+ * browser's localStorage) that survives page reloads and dropped connections.
+ * `socketId` is the CURRENT live Socket.io connection and changes every time
+ * the browser reconnects. All game logic (votes, targets, lovers, host,
+ * pending hunter, etc.) references the stable `id`, never `socketId` — so a
+ * player who briefly loses signal keeps their seat, their role, and their
+ * place in the vote count. On disconnect we start a grace period (see
+ * DISCONNECT_GRACE_MS) before actually removing someone from the game.
  */
 
 const express = require('express');
@@ -62,6 +66,8 @@ const DEFAULT_SETTINGS = {
 const MIN_PLAYERS = 4;
 const MAX_PLAYERS = 20;
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; // no O/I to avoid confusion
+const DISCONNECT_GRACE_MS = 90 * 1000; // how long a dropped player can reconnect
+const ROLE_REVEAL_MAX_MS = 60 * 1000; // safety-net timeout if not everyone clicks "Ready"
 
 function genCode(len = 5) {
   let code;
@@ -74,24 +80,28 @@ function genCode(len = 5) {
   return code;
 }
 
-function makeRoom(code, hostSocketId) {
+function makeRoom(code, hostId) {
   return {
     code,
-    hostId: hostSocketId,
-    players: [], // {id, name, alive, role, isHost, ...}
+    hostId, // stable player id, NOT a socket id
+    players: [], // {id (stable), socketId (live), name, alive, role, connected, disconnectTimer, ...}
     settings: { ...DEFAULT_SETTINGS },
     phase: 'lobby', // lobby -> reveal -> night -> day-announce -> day-discuss -> day-vote -> day-result -> gameover
     nightNumber: 0,
     night: freshNight(),
-    dayVotes: {}, // voterId -> targetId
+    dayVotes: {}, // voterId -> targetId (both stable ids)
     lovers: [], // [id, id]
     centerCards: [], // hidden roles not assigned to any player (used by Drunk)
     lastMedicTarget: null, // enforce "can't protect the same person twice in a row"
     witchPotions: { healUsed: false, poisonUsed: false }, // persists for the WHOLE game
+    readyPlayers: new Set(), // stable ids who clicked "Ready" during role reveal
+    lastAnnouncement: null, // for reconnect catch-up
+    lastVoteResult: null, // for reconnect catch-up
+    lastGameOver: null, // for reconnect catch-up
     log: [],
     timer: null, // active setTimeout handle
     timerEndsAt: null,
-    pendingHunter: null, // playerId awaiting hunter-shot resolution
+    pendingHunter: null, // stable player id awaiting hunter-shot resolution
     afterHunterPhase: null, // phase to continue to once hunter resolves
   };
 }
@@ -126,6 +136,7 @@ function publicPlayers(room) {
     name: p.name,
     alive: p.alive,
     isHost: p.id === room.hostId,
+    connected: p.connected,
     // role only exposed once game is over or to the player themself (handled elsewhere)
   }));
 }
@@ -171,6 +182,11 @@ function clearTimer(room) {
 
 function log(room, message) {
   room.log.push({ t: Date.now(), message });
+}
+
+/** Emit an event to a single player's CURRENT live socket, if they're connected. */
+function toPlayer(player, event, payload) {
+  if (player && player.socketId) io.to(player.socketId).emit(event, payload);
 }
 
 // ---------------------------------------------------------------------------
@@ -298,30 +314,34 @@ const ROLE_INFO = {
   },
 };
 
+function roleRevealPayloadFor(room, p) {
+  const info = ROLE_INFO[p.role];
+  const wolfTeammates =
+    p.role === 'werewolf'
+      ? room.players.filter((o) => o.role === 'werewolf' && o.id !== p.id).map((o) => o.name)
+      : undefined;
+  const werewolfNames =
+    p.role === 'minion'
+      ? room.players.filter((o) => o.role === 'werewolf').map((o) => o.name)
+      : undefined;
+  const masonTeammates =
+    p.role === 'mason'
+      ? room.players.filter((o) => o.role === 'mason' && o.id !== p.id).map((o) => o.name)
+      : undefined;
+  return {
+    role: p.role,
+    team: info.team,
+    label: info.label,
+    instructions: info.instructions,
+    wolfTeammates,
+    werewolfNames,
+    masonTeammates,
+  };
+}
+
 function roleReveal(room) {
   room.players.forEach((p) => {
-    const info = ROLE_INFO[p.role];
-    const wolfTeammates =
-      p.role === 'werewolf'
-        ? room.players.filter((o) => o.role === 'werewolf' && o.id !== p.id).map((o) => o.name)
-        : undefined;
-    const werewolfNames =
-      p.role === 'minion'
-        ? room.players.filter((o) => o.role === 'werewolf').map((o) => o.name)
-        : undefined;
-    const masonTeammates =
-      p.role === 'mason'
-        ? room.players.filter((o) => o.role === 'mason' && o.id !== p.id).map((o) => o.name)
-        : undefined;
-    io.to(p.id).emit('roleAssigned', {
-      role: p.role,
-      team: info.team,
-      label: info.label,
-      instructions: info.instructions,
-      wolfTeammates,
-      werewolfNames,
-      masonTeammates,
-    });
+    toPlayer(p, 'roleAssigned', roleRevealPayloadFor(room, p));
   });
 }
 
@@ -346,6 +366,19 @@ function computeNightSteps(room) {
   return steps;
 }
 
+/** True if the current night step can never be completed (its sole actor
+ * disconnected-and-was-removed, or similar), meaning we should skip past it. */
+function isStepStuck(room) {
+  if (room.phase !== 'night') return false;
+  const soloStepRole = {
+    cupid: 'cupid', robber: 'robber', troublemaker: 'troublemaker', drunk: 'drunk',
+    insomniac: 'insomniac', seer: 'seer', medic: 'medic', witch: 'witch',
+  }[room.night.step];
+  if (soloStepRole) return !alivePlayerWithRole(room, soloStepRole);
+  if (room.night.step === 'wolves') return aliveWolves(room).length === 0;
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Phase transitions
 // ---------------------------------------------------------------------------
@@ -356,12 +389,13 @@ function startGame(room) {
   room.nightNumber = 0;
   room.lovers = [];
   room.log = [];
+  room.readyPlayers = new Set();
   broadcastRoom(room);
   roleReveal(room);
-  // give everyone a few seconds to read their role, then begin night 1
+  // Safety net only — normally everyone clicks "Ready" and we advance sooner.
   clearTimer(room);
-  room.timer = setTimeout(() => beginNight(room), 6000);
-  room.timerEndsAt = Date.now() + 6000;
+  room.timer = setTimeout(() => beginNight(room), ROLE_REVEAL_MAX_MS);
+  room.timerEndsAt = Date.now() + ROLE_REVEAL_MAX_MS;
 }
 
 function beginNight(room) {
@@ -377,57 +411,60 @@ function beginNight(room) {
   emitNightState(room);
 }
 
-function emitNightState(room) {
+function nightStatePayloadFor(room, p) {
   const n = room.night;
-  room.players.forEach((p) => {
-    if (!p.alive) {
-      io.to(p.id).emit('nightState', { step: n.step, youAre: p.role, alive: false });
-      return;
-    }
-    const payload = { step: n.step, youAre: p.role, alive: true };
+  if (!p.alive) {
+    return { step: n.step, youAre: p.role, alive: false };
+  }
+  const payload = { step: n.step, youAre: p.role, alive: true };
 
-    if (n.step === 'cupid' && p.role === 'cupid') {
-      payload.action = 'cupid';
-      payload.options = room.players.filter((o) => o.alive).map((o) => ({ id: o.id, name: o.name }));
-    } else if (n.step === 'robber' && p.role === 'robber') {
-      payload.action = 'robber';
-      payload.options = alivePlayers(room).filter((o) => o.id !== p.id).map((o) => ({ id: o.id, name: o.name }));
-    } else if (n.step === 'troublemaker' && p.role === 'troublemaker') {
-      payload.action = 'troublemaker';
-      payload.options = alivePlayers(room).filter((o) => o.id !== p.id).map((o) => ({ id: o.id, name: o.name }));
-    } else if (n.step === 'drunk' && p.role === 'drunk') {
-      payload.action = 'drunk';
-    } else if (n.step === 'insomniac' && p.role === 'insomniac') {
-      payload.action = 'insomniac';
-      payload.currentRole = ROLE_INFO[p.role].label;
-    } else if (n.step === 'wolves' && p.role === 'werewolf') {
-      payload.action = 'wolves';
-      payload.options = alivePlayers(room)
-        .filter((o) => o.role !== 'werewolf')
-        .map((o) => ({ id: o.id, name: o.name }));
-      payload.wolfVotes = n.wolfVotes;
-      payload.wolfTeam = aliveWolves(room).map((w) => w.name);
-    } else if (n.step === 'seer' && p.role === 'seer') {
-      payload.action = 'seer';
-      payload.options = alivePlayers(room).filter((o) => o.id !== p.id).map((o) => ({ id: o.id, name: o.name }));
-      payload.lastResult = n.seerResult;
-    } else if (n.step === 'medic' && p.role === 'medic') {
-      payload.action = 'medic';
-      payload.options = alivePlayers(room)
-        .filter((o) => o.id !== room.lastMedicTarget)
-        .map((o) => ({ id: o.id, name: o.name }));
-    } else if (n.step === 'witch' && p.role === 'witch') {
-      payload.action = 'witch';
-      payload.wolfTargetName = n.wolfTarget ? findPlayer(room, n.wolfTarget)?.name : null;
-      payload.canHeal = !room.witchPotions.healUsed;
-      payload.canPoison = !room.witchPotions.poisonUsed;
-      payload.poisonOptions = alivePlayers(room)
-        .filter((o) => o.id !== p.id)
-        .map((o) => ({ id: o.id, name: o.name }));
-    } else {
-      payload.action = 'wait';
-    }
-    io.to(p.id).emit('nightState', payload);
+  if (n.step === 'cupid' && p.role === 'cupid') {
+    payload.action = 'cupid';
+    payload.options = room.players.filter((o) => o.alive).map((o) => ({ id: o.id, name: o.name }));
+  } else if (n.step === 'robber' && p.role === 'robber') {
+    payload.action = 'robber';
+    payload.options = alivePlayers(room).filter((o) => o.id !== p.id).map((o) => ({ id: o.id, name: o.name }));
+  } else if (n.step === 'troublemaker' && p.role === 'troublemaker') {
+    payload.action = 'troublemaker';
+    payload.options = alivePlayers(room).filter((o) => o.id !== p.id).map((o) => ({ id: o.id, name: o.name }));
+  } else if (n.step === 'drunk' && p.role === 'drunk') {
+    payload.action = 'drunk';
+  } else if (n.step === 'insomniac' && p.role === 'insomniac') {
+    payload.action = 'insomniac';
+    payload.currentRole = ROLE_INFO[p.role].label;
+  } else if (n.step === 'wolves' && p.role === 'werewolf') {
+    payload.action = 'wolves';
+    payload.options = alivePlayers(room)
+      .filter((o) => o.role !== 'werewolf')
+      .map((o) => ({ id: o.id, name: o.name }));
+    payload.wolfVotes = n.wolfVotes;
+    payload.wolfTeam = aliveWolves(room).map((w) => w.name);
+  } else if (n.step === 'seer' && p.role === 'seer') {
+    payload.action = 'seer';
+    payload.options = alivePlayers(room).filter((o) => o.id !== p.id).map((o) => ({ id: o.id, name: o.name }));
+    payload.lastResult = n.seerResult;
+  } else if (n.step === 'medic' && p.role === 'medic') {
+    payload.action = 'medic';
+    payload.options = alivePlayers(room)
+      .filter((o) => o.id !== room.lastMedicTarget)
+      .map((o) => ({ id: o.id, name: o.name }));
+  } else if (n.step === 'witch' && p.role === 'witch') {
+    payload.action = 'witch';
+    payload.wolfTargetName = n.wolfTarget ? findPlayer(room, n.wolfTarget)?.name : null;
+    payload.canHeal = !room.witchPotions.healUsed;
+    payload.canPoison = !room.witchPotions.poisonUsed;
+    payload.poisonOptions = alivePlayers(room)
+      .filter((o) => o.id !== p.id)
+      .map((o) => ({ id: o.id, name: o.name }));
+  } else {
+    payload.action = 'wait';
+  }
+  return payload;
+}
+
+function emitNightState(room) {
+  room.players.forEach((p) => {
+    toPlayer(p, 'nightState', nightStatePayloadFor(room, p));
   });
 }
 
@@ -435,6 +472,10 @@ function advanceNightStep(room) {
   const n = room.night;
   n.stepIndex += 1;
   n.step = n.stepOrder[n.stepIndex] || 'resolve';
+  while (n.step !== 'resolve' && isStepStuck(room)) {
+    n.stepIndex += 1;
+    n.step = n.stepOrder[n.stepIndex] || 'resolve';
+  }
   if (n.step === 'resolve') {
     resolveNight(room);
     return;
@@ -472,11 +513,12 @@ function resolveNight(room) {
   log(room, `Night ${room.nightNumber}: ${deathList.length ? deathList.map((p) => p.name).join(', ') + ' died.' : 'nobody died.'}`);
 
   room.phase = 'day-announce';
-  broadcastRoom(room);
-  io.to(room.code).emit('dayAnnouncement', {
+  room.lastAnnouncement = {
     nightNumber: room.nightNumber,
     deaths: deathList.map((p) => ({ id: p.id, name: p.name, role: p.role })),
-  });
+  };
+  broadcastRoom(room);
+  io.to(room.code).emit('dayAnnouncement', room.lastAnnouncement);
 
   // hunter chain-check
   const hunterDied = deathList.find((p) => p.role === 'hunter' && !p.hunterFired);
@@ -507,7 +549,7 @@ function triggerHunter(room, hunterPlayer, nextPhase) {
   room.afterHunterPhase = nextPhase;
   room.phase = 'hunter-shot';
   broadcastRoom(room);
-  io.to(hunterPlayer.id).emit('hunterPrompt', {
+  toPlayer(hunterPlayer, 'hunterPrompt', {
     options: alivePlayers(room).filter((o) => o.id !== hunterPlayer.id).map((o) => ({ id: o.id, name: o.name })),
   });
   io.to(room.code).emit('phaseNote', { message: `${hunterPlayer.name} was the Hunter and is choosing a final target...` });
@@ -524,6 +566,7 @@ function goToDiscussion(room) {
     clearTimer(room);
     room.timer = setTimeout(() => goToVote(room), secs * 1000);
   } else {
+    room.timerEndsAt = null;
     io.to(room.code).emit('discussionStarted', { endsAt: null });
   }
 }
@@ -579,19 +622,21 @@ function resolveVotes(room) {
     eliminated.diedAt = room.nightNumber;
     eliminated.diedPhase = 'day';
     log(room, `Day ${room.nightNumber}: the village lynched ${eliminated.name} — the Tanner!`);
-    broadcastRoom(room);
-    io.to(room.code).emit('voteResult', {
+    room.lastVoteResult = {
       counts,
       tie: false,
       eliminated: [{ id: eliminated.id, name: eliminated.name, role: eliminated.role }],
-    });
+    };
+    broadcastRoom(room);
+    io.to(room.code).emit('voteResult', room.lastVoteResult);
     room.phase = 'gameover';
     clearTimer(room);
-    io.to(room.code).emit('gameOver', {
+    room.lastGameOver = {
       winner: 'tanner',
       winnerName: eliminated.name,
       players: room.players.map((p) => ({ id: p.id, name: p.name, role: p.role, alive: p.alive })),
-    });
+    };
+    io.to(room.code).emit('gameOver', room.lastGameOver);
     broadcastRoom(room);
     return;
   }
@@ -608,12 +653,13 @@ function resolveVotes(room) {
 
   log(room, `Day ${room.nightNumber}: vote result — ${deathList.length ? deathList.map((p) => p.name).join(', ') + ' eliminated.' : 'no one eliminated (tie).'}`);
 
-  broadcastRoom(room);
-  io.to(room.code).emit('voteResult', {
+  room.lastVoteResult = {
     counts,
     tie: leaders.length > 1,
     eliminated: deathList.map((p) => ({ id: p.id, name: p.name, role: p.role })),
-  });
+  };
+  broadcastRoom(room);
+  io.to(room.code).emit('voteResult', room.lastVoteResult);
 
   const hunterDied = deathList.find((p) => p.role === 'hunter' && !p.hunterFired);
   if (hunterDied) {
@@ -638,10 +684,11 @@ function checkWin(room) {
   if (winner) {
     room.phase = 'gameover';
     clearTimer(room);
-    io.to(room.code).emit('gameOver', {
+    room.lastGameOver = {
       winner,
       players: room.players.map((p) => ({ id: p.id, name: p.name, role: p.role, alive: p.alive })),
-    });
+    };
+    io.to(room.code).emit('gameOver', room.lastGameOver);
     broadcastRoom(room);
     return true;
   }
@@ -649,25 +696,66 @@ function checkWin(room) {
 }
 
 // ---------------------------------------------------------------------------
+// Reconnection catch-up: re-sends whatever the reconnecting player's screen
+// should currently show, based on the room's phase.
+// ---------------------------------------------------------------------------
+
+function sendCatchUp(room, player) {
+  broadcastRoom(room);
+
+  if (room.phase === 'lobby') return;
+
+  if (player.role) {
+    toPlayer(player, 'roleAssigned', roleRevealPayloadFor(room, player));
+  }
+
+  if (room.phase === 'reveal') {
+    toPlayer(player, 'revealReadyUpdate', { ready: room.readyPlayers.size, total: alivePlayers(room).length });
+  } else if (room.phase === 'night') {
+    toPlayer(player, 'nightState', nightStatePayloadFor(room, player));
+  } else if (room.phase === 'hunter-shot') {
+    if (room.pendingHunter === player.id) {
+      toPlayer(player, 'hunterPrompt', {
+        options: alivePlayers(room).filter((o) => o.id !== player.id).map((o) => ({ id: o.id, name: o.name })),
+      });
+    }
+  } else if (room.phase === 'day-announce') {
+    if (room.lastAnnouncement) toPlayer(player, 'dayAnnouncement', room.lastAnnouncement);
+  } else if (room.phase === 'day-discuss') {
+    toPlayer(player, 'discussionStarted', { endsAt: room.timerEndsAt || null });
+  } else if (room.phase === 'day-vote') {
+    toPlayer(player, 'voteStarted', { options: alivePlayers(room).map((o) => ({ id: o.id, name: o.name })) });
+    toPlayer(player, 'voteTally', { counts: tallyVotes(room), votesIn: Object.keys(room.dayVotes).length, totalAlive: alivePlayers(room).length });
+  } else if (room.phase === 'day-result') {
+    if (room.lastVoteResult) toPlayer(player, 'voteResult', room.lastVoteResult);
+  } else if (room.phase === 'gameover') {
+    if (room.lastGameOver) toPlayer(player, 'gameOver', room.lastGameOver);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Socket handlers
 // ---------------------------------------------------------------------------
 
 io.on('connection', (socket) => {
-  socket.on('createRoom', ({ name }, ack) => {
+  socket.on('createRoom', ({ name, clientId }, ack) => {
     name = (name || '').trim().slice(0, 20) || 'Host';
+    if (!clientId) return ack && ack({ success: false, error: 'Missing client id.' });
     const code = genCode();
-    const room = makeRoom(code, socket.id);
-    room.players.push({ id: socket.id, name, alive: true, role: null });
+    const room = makeRoom(code, clientId);
+    room.players.push({ id: clientId, socketId: socket.id, name, alive: true, role: null, connected: true, disconnectTimer: null });
     rooms[code] = room;
     socket.join(code);
     socket.data.roomCode = code;
-    ack && ack({ success: true, code, hostId: socket.id });
+    socket.data.pid = clientId;
+    ack && ack({ success: true, code, hostId: clientId });
     broadcastRoom(room);
   });
 
-  socket.on('joinRoom', ({ name, code }, ack) => {
+  socket.on('joinRoom', ({ name, code, clientId }, ack) => {
     const room = getRoom(code);
     name = (name || '').trim().slice(0, 20);
+    if (!clientId) return ack && ack({ success: false, error: 'Missing client id.' });
     if (!room) return ack && ack({ success: false, error: 'Room code not found.' });
     if (room.phase !== 'lobby') return ack && ack({ success: false, error: 'Game already in progress.' });
     if (room.players.length >= MAX_PLAYERS) return ack && ack({ success: false, error: 'Room is full.' });
@@ -675,16 +763,39 @@ io.on('connection', (socket) => {
     if (room.players.some((p) => p.name.toLowerCase() === name.toLowerCase())) {
       return ack && ack({ success: false, error: 'That name is already taken in this room.' });
     }
-    room.players.push({ id: socket.id, name, alive: true, role: null });
+    room.players.push({ id: clientId, socketId: socket.id, name, alive: true, role: null, connected: true, disconnectTimer: null });
     socket.join(room.code);
     socket.data.roomCode = room.code;
+    socket.data.pid = clientId;
     ack && ack({ success: true, code: room.code, hostId: room.hostId });
     broadcastRoom(room);
   });
 
+  // Reattach a returning browser (reload, dropped wifi, backgrounded tab) to
+  // its existing seat, without losing role/votes/game progress.
+  socket.on('rejoinRoom', ({ code, clientId }, ack) => {
+    const room = getRoom(code);
+    if (!room || !clientId) return ack && ack({ success: false, error: 'Room not found.' });
+    const player = findPlayer(room, clientId);
+    if (!player) return ack && ack({ success: false, error: 'You are not part of this room.' });
+
+    if (player.disconnectTimer) {
+      clearTimeout(player.disconnectTimer);
+      player.disconnectTimer = null;
+    }
+    player.socketId = socket.id;
+    player.connected = true;
+    socket.join(room.code);
+    socket.data.roomCode = room.code;
+    socket.data.pid = clientId;
+
+    ack && ack({ success: true, code: room.code, hostId: room.hostId, phase: room.phase, name: player.name });
+    sendCatchUp(room, player);
+  });
+
   socket.on('updateSettings', ({ code, settings }) => {
     const room = getRoom(code);
-    if (!room || room.hostId !== socket.id || room.phase !== 'lobby') return;
+    if (!room || room.hostId !== socket.data.pid || room.phase !== 'lobby') return;
     room.settings = {
       werewolves: Math.max(1, Math.min(8, parseInt(settings.werewolves) || 1)),
       seer: !!settings.seer,
@@ -708,9 +819,23 @@ io.on('connection', (socket) => {
 
   socket.on('startGame', ({ code }) => {
     const room = getRoom(code);
-    if (!room || room.hostId !== socket.id || room.phase !== 'lobby') return;
+    if (!room || room.hostId !== socket.data.pid || room.phase !== 'lobby') return;
     if (room.players.length < MIN_PLAYERS) return;
     startGame(room);
+  });
+
+  // ---- Role reveal ----
+  socket.on('roleReady', ({ code }) => {
+    const room = getRoom(code);
+    if (!room || room.phase !== 'reveal') return;
+    const me = findPlayer(room, socket.data.pid);
+    if (!me) return;
+    room.readyPlayers.add(me.id);
+    const total = alivePlayers(room).length;
+    io.to(room.code).emit('revealReadyUpdate', { ready: room.readyPlayers.size, total });
+    if (room.readyPlayers.size >= total) {
+      beginNight(room);
+    }
   });
 
   // ---- Night actions ----
@@ -718,34 +843,36 @@ io.on('connection', (socket) => {
   socket.on('cupidChoose', ({ code, targets }) => {
     const room = getRoom(code);
     if (!room || room.phase !== 'night' || room.night.step !== 'cupid') return;
-    const me = findPlayer(room, socket.id);
+    const me = findPlayer(room, socket.data.pid);
     if (!me || me.role !== 'cupid' || !me.alive) return;
     if (!Array.isArray(targets) || targets.length !== 2) return;
     room.lovers = targets;
     room.night.cupidDone = true;
-    io.to(targets[0]).emit('loversRevealed', { partnerId: targets[1], partnerName: findPlayer(room, targets[1])?.name });
-    io.to(targets[1]).emit('loversRevealed', { partnerId: targets[0], partnerName: findPlayer(room, targets[0])?.name });
+    const p1 = findPlayer(room, targets[0]);
+    const p2 = findPlayer(room, targets[1]);
+    toPlayer(p1, 'loversRevealed', { partnerId: targets[1], partnerName: p2?.name });
+    toPlayer(p2, 'loversRevealed', { partnerId: targets[0], partnerName: p1?.name });
     advanceNightStep(room);
   });
 
   socket.on('robberSwap', ({ code, targetId }) => {
     const room = getRoom(code);
     if (!room || room.phase !== 'night' || room.night.step !== 'robber') return;
-    const me = findPlayer(room, socket.id);
+    const me = findPlayer(room, socket.data.pid);
     const target = findPlayer(room, targetId);
     if (!me || me.role !== 'robber' || !me.alive || !target || target.id === me.id || !target.alive) return;
     const temp = me.role;
     me.role = target.role;
     target.role = temp;
     const info = ROLE_INFO[me.role];
-    io.to(me.id).emit('roleUpdated', { role: me.role, label: info.label, team: info.team, instructions: info.instructions });
+    toPlayer(me, 'roleUpdated', { role: me.role, label: info.label, team: info.team, instructions: info.instructions });
     advanceNightStep(room);
   });
 
   socket.on('troublemakerSwap', ({ code, targetAId, targetBId }) => {
     const room = getRoom(code);
     if (!room || room.phase !== 'night' || room.night.step !== 'troublemaker') return;
-    const me = findPlayer(room, socket.id);
+    const me = findPlayer(room, socket.data.pid);
     const a = findPlayer(room, targetAId);
     const b = findPlayer(room, targetBId);
     if (!me || me.role !== 'troublemaker' || !me.alive) return;
@@ -759,7 +886,7 @@ io.on('connection', (socket) => {
   socket.on('drunkSwap', ({ code }) => {
     const room = getRoom(code);
     if (!room || room.phase !== 'night' || room.night.step !== 'drunk') return;
-    const me = findPlayer(room, socket.id);
+    const me = findPlayer(room, socket.data.pid);
     if (!me || me.role !== 'drunk' || !me.alive) return;
     if (room.centerCards.length > 0) {
       const idx = Math.floor(Math.random() * room.centerCards.length);
@@ -773,7 +900,7 @@ io.on('connection', (socket) => {
   socket.on('insomniacDone', ({ code }) => {
     const room = getRoom(code);
     if (!room || room.phase !== 'night' || room.night.step !== 'insomniac') return;
-    const me = findPlayer(room, socket.id);
+    const me = findPlayer(room, socket.data.pid);
     if (!me || me.role !== 'insomniac' || !me.alive) return;
     advanceNightStep(room);
   });
@@ -781,12 +908,12 @@ io.on('connection', (socket) => {
   socket.on('wolfVote', ({ code, targetId }) => {
     const room = getRoom(code);
     if (!room || room.phase !== 'night' || room.night.step !== 'wolves') return;
-    const me = findPlayer(room, socket.id);
+    const me = findPlayer(room, socket.data.pid);
     if (!me || me.role !== 'werewolf' || !me.alive) return;
-    room.night.wolfVotes[socket.id] = targetId;
+    room.night.wolfVotes[me.id] = targetId;
 
     // broadcast live tally to wolves
-    aliveWolves(room).forEach((w) => io.to(w.id).emit('wolfVoteUpdate', { wolfVotes: room.night.wolfVotes }));
+    aliveWolves(room).forEach((w) => toPlayer(w, 'wolfVoteUpdate', { wolfVotes: room.night.wolfVotes }));
 
     const wolves = aliveWolves(room);
     if (Object.keys(room.night.wolfVotes).length >= wolves.length) {
@@ -805,21 +932,21 @@ io.on('connection', (socket) => {
   socket.on('seerInspect', ({ code, targetId }) => {
     const room = getRoom(code);
     if (!room || room.phase !== 'night' || room.night.step !== 'seer') return;
-    const me = findPlayer(room, socket.id);
+    const me = findPlayer(room, socket.data.pid);
     if (!me || me.role !== 'seer' || !me.alive) return;
     const target = findPlayer(room, targetId);
     if (!target) return;
     const result = target.role === 'werewolf' ? 'werewolf' : 'villager';
     room.night.seerTarget = targetId;
     room.night.seerResult = { name: target.name, result };
-    io.to(socket.id).emit('seerResult', room.night.seerResult);
+    toPlayer(me, 'seerResult', room.night.seerResult);
     advanceNightStep(room);
   });
 
   socket.on('medicProtect', ({ code, targetId }) => {
     const room = getRoom(code);
     if (!room || room.phase !== 'night' || room.night.step !== 'medic') return;
-    const me = findPlayer(room, socket.id);
+    const me = findPlayer(room, socket.data.pid);
     const target = findPlayer(room, targetId);
     if (!me || me.role !== 'medic' || !me.alive || !target || !target.alive) return;
     if (targetId === room.lastMedicTarget) return; // can't repeat
@@ -831,7 +958,7 @@ io.on('connection', (socket) => {
   socket.on('witchAction', ({ code, heal, poisonTargetId }) => {
     const room = getRoom(code);
     if (!room || room.phase !== 'night' || room.night.step !== 'witch') return;
-    const me = findPlayer(room, socket.id);
+    const me = findPlayer(room, socket.data.pid);
     if (!me || me.role !== 'witch' || !me.alive) return;
     if (heal && !room.witchPotions.healUsed) {
       room.night.witchHeal = true;
@@ -847,8 +974,8 @@ io.on('connection', (socket) => {
   // ---- Hunter ----
   socket.on('hunterShoot', ({ code, targetId }) => {
     const room = getRoom(code);
-    if (!room || room.phase !== 'hunter-shot' || room.pendingHunter !== socket.id) return;
-    const hunter = findPlayer(room, socket.id);
+    if (!room || room.phase !== 'hunter-shot' || room.pendingHunter !== socket.data.pid) return;
+    const hunter = findPlayer(room, socket.data.pid);
     const target = findPlayer(room, targetId);
     hunter.hunterFired = true;
     if (target && target.alive) {
@@ -878,22 +1005,22 @@ io.on('connection', (socket) => {
   socket.on('dayVote', ({ code, targetId }) => {
     const room = getRoom(code);
     if (!room || room.phase !== 'day-vote') return;
-    const me = findPlayer(room, socket.id);
+    const me = findPlayer(room, socket.data.pid);
     if (!me || !me.alive) return;
-    room.dayVotes[socket.id] = targetId;
+    room.dayVotes[me.id] = targetId;
     io.to(room.code).emit('voteTally', { counts: tallyVotes(room), votesIn: Object.keys(room.dayVotes).length, totalAlive: alivePlayers(room).length });
     maybeResolveVotes(room);
   });
 
   socket.on('hostSkipTimer', ({ code }) => {
     const room = getRoom(code);
-    if (!room || room.hostId !== socket.id) return;
+    if (!room || room.hostId !== socket.data.pid) return;
     if (room.phase === 'day-discuss') goToVote(room);
   });
 
   socket.on('playAgain', ({ code }) => {
     const room = getRoom(code);
-    if (!room || room.hostId !== socket.id) return;
+    if (!room || room.hostId !== socket.data.pid) return;
     clearTimer(room);
     room.phase = 'lobby';
     room.nightNumber = 0;
@@ -902,6 +1029,10 @@ io.on('connection', (socket) => {
     room.centerCards = [];
     room.lastMedicTarget = null;
     room.witchPotions = { healUsed: false, poisonUsed: false };
+    room.readyPlayers = new Set();
+    room.lastAnnouncement = null;
+    room.lastVoteResult = null;
+    room.lastGameOver = null;
     room.night = freshNight();
     room.players.forEach((p) => {
       p.alive = true;
@@ -911,16 +1042,42 @@ io.on('connection', (socket) => {
     broadcastRoom(room);
   });
 
-  socket.on('leaveRoom', () => handleDisconnect(socket));
+  socket.on('leaveRoom', () => removePlayerNow(socket));
   socket.on('disconnect', () => handleDisconnect(socket));
 
   function handleDisconnect(socket) {
     const code = socket.data.roomCode;
     const room = getRoom(code);
     if (!room) return;
-    const idx = room.players.findIndex((p) => p.id === socket.id);
+    const player = findPlayer(room, socket.data.pid);
+    if (!player || player.socketId !== socket.id) return; // a newer connection already replaced this one
+
+    player.connected = false;
+    broadcastRoom(room); // let others see the "reconnecting..." indicator immediately
+
+    // Lobby: no grace period needed, just drop them — nothing to preserve yet.
+    if (room.phase === 'lobby') {
+      removePlayerNow(socket);
+      return;
+    }
+
+    // Mid-game: give them a window to come back before losing their seat.
+    player.disconnectTimer = setTimeout(() => {
+      finalizeRemoval(room, player.id);
+    }, DISCONNECT_GRACE_MS);
+  }
+
+  function removePlayerNow(socket) {
+    const code = socket.data.roomCode;
+    const room = getRoom(code);
+    if (!room) return;
+    finalizeRemoval(room, socket.data.pid);
+  }
+
+  function finalizeRemoval(room, pid) {
+    const idx = room.players.findIndex((p) => p.id === pid);
     if (idx === -1) return;
-    const wasHost = room.hostId === socket.id;
+    const wasHost = room.hostId === pid;
     room.players.splice(idx, 1);
 
     if (room.players.length === 0) {
@@ -933,9 +1090,20 @@ io.on('connection', (socket) => {
       room.hostId = room.players[0].id;
     }
     broadcastRoom(room);
-    if (room.phase !== 'lobby') {
-      // a player leaving mid-game — re-check win conditions in case it swings the balance
-      checkWin(room);
+
+    if (room.phase === 'lobby') return;
+
+    // A player leaving mid-game can swing the win condition.
+    if (checkWin(room)) return;
+
+    // If it was this removed player's turn to act, don't let the night stall.
+    if (room.phase === 'night' && isStepStuck(room)) {
+      advanceNightStep(room);
+    }
+    // If the vote can now resolve because the removed player's vote is no
+    // longer awaited, check.
+    if (room.phase === 'day-vote') {
+      maybeResolveVotes(room);
     }
   }
 });
